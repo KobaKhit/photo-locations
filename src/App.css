@@ -350,10 +350,10 @@ body,
 
 .hud__title {
   margin: 0;
-  font-family: 'Syne', sans-serif;
-  font-weight: 800;
+  font-family: 'IBM Plex Sans', system-ui, sans-serif;
+  font-weight: 700;
   font-size: clamp(1.15rem, 2.4vw, 1.7rem);
-  letter-spacing: -0.03em;
+  letter-spacing: -0.01em;
   color: var(--accent);
 }
 
