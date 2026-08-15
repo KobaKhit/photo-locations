@@ -1,0 +1,4 @@
+/* Base reset lives in App.css — keep this file minimal for Vite entry. */
+body {
+  margin: 0;
+}
