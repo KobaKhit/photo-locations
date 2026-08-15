@@ -145,15 +145,6 @@ const BASEMAP = {
   ],
 }
 
-const DENSITY_COLORS: [number, number, number, number][] = [
-  [80, 0, 120, 200],
-  [150, 0, 180, 210],
-  [220, 20, 120, 220],
-  [255, 90, 50, 230],
-  [255, 180, 40, 240],
-  [255, 245, 180, 255],
-]
-
 type DisplayMode = 'hex' | 'points'
 type ProjectionMode = 'mercator' | 'equal-earth'
 type XY = [number, number]
@@ -166,13 +157,32 @@ type EqualEarthBin = {
   color: Rgba
 }
 
-/** Points stay on the original warm amber, then shift hotter in dense cells. */
+/**
+ * Truncated Inferno (matplotlib / SciPy) for dark basemaps.
+ * Skips near-black stops so sparse cells stay visible; low→high = dim→bright.
+ * Perceptually uniform + colorblind-safer than rainbow/jet; greyscale-friendly.
+ * @see https://bids.github.io/colormap/
+ */
+const DENSITY_COLORS: Rgba[] = [
+  [55, 14, 94, 195],
+  [105, 23, 110, 210],
+  [158, 47, 89, 220],
+  [208, 72, 54, 230],
+  [240, 135, 33, 240],
+  [249, 191, 57, 250],
+  [252, 246, 164, 255],
+]
+
+/**
+ * Points share Inferno’s warm half only — sparse dots stay luminous amber/gold
+ * on dark land/ocean; denser cells climb toward yellow-white.
+ */
 const POINT_COLORS: Rgba[] = [
-  [255, 210, 120, 110],
-  [255, 185, 95, 145],
-  [255, 155, 70, 175],
-  [255, 225, 130, 210],
-  [255, 245, 185, 235],
+  [255, 196, 110, 125],
+  [248, 150, 55, 155],
+  [240, 110, 45, 180],
+  [250, 175, 50, 210],
+  [252, 230, 130, 235],
 ]
 
 /** Color each point from local geographic density (no glow). */
@@ -424,12 +434,27 @@ export function MapView({
         >
           {exporting ? 'Rendering…' : 'Export 8K'}
         </button>
+        <div className="density-legend" aria-hidden="true">
+          <span className="density-legend__label">Density</span>
+          <div
+            className="density-legend__ramp"
+            style={{
+              background: `linear-gradient(90deg, ${DENSITY_COLORS.map(
+                ([r, g, b]) => `rgb(${r},${g},${b})`,
+              ).join(', ')})`,
+            }}
+          />
+          <div className="density-legend__ends">
+            <span>Low</span>
+            <span>High</span>
+          </div>
+        </div>
       </div>
 
       <p className="map-hint">
         {displayMode === 'hex'
-          ? 'Hex density · switch to Points for raw locations'
-          : 'Individual photo locations · warmer = denser area'}
+          ? 'Hex density · Inferno scale · brighter = more photos'
+          : 'Points · amber→hot · brighter = denser area'}
       </p>
       <p className="map-credit">
         Built by kobakhit · © Natural Earth · © OSM · © CARTO · Flickr · deck.gl
@@ -1049,6 +1074,7 @@ async function downloadHighResMap(
     260,
     268,
   )
+  drawExportDensityLegend(context, 260, 300)
 
   drawExportControls(context, width, options)
   await drawExportPanels(context, width, height, hotspots, mostViewed)
@@ -1336,6 +1362,34 @@ function drawExportHotspots(
     context.fillStyle = '#e8ecef'
     context.fillText(label, x + 16, y)
   }
+}
+
+function drawExportDensityLegend(
+  context: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+) {
+  const rampWidth = 520
+  const rampHeight = 22
+  const gradient = context.createLinearGradient(x, y, x + rampWidth, y)
+  DENSITY_COLORS.forEach(([r, g, b], index) => {
+    gradient.addColorStop(
+      index / Math.max(DENSITY_COLORS.length - 1, 1),
+      `rgb(${r},${g},${b})`,
+    )
+  })
+  context.fillStyle = gradient
+  context.fillRect(x, y, rampWidth, rampHeight)
+  context.strokeStyle = 'rgba(255,255,255,0.2)'
+  context.lineWidth = 1
+  context.strokeRect(x, y, rampWidth, rampHeight)
+
+  context.fillStyle = '#8b969e'
+  context.font = '500 22px Arial, sans-serif'
+  context.fillText('Low density', x, y + 52)
+  context.textAlign = 'right'
+  context.fillText('High density', x + rampWidth, y + 52)
+  context.textAlign = 'start'
 }
 
 function drawExportControls(

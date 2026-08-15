@@ -27,14 +27,15 @@ export type PhotoDataset = {
 }
 
 const PIN_COLORS = [
-  '#f5e642',
-  '#a855f7',
-  '#ef4444',
-  '#3b82f6',
-  '#ec4899',
-  '#f97316',
-  '#22d3ee',
-  '#e879f9',
+  // Okabe–Ito (colorblind-safe categorical markers)
+  '#E69F00',
+  '#56B4E9',
+  '#009E73',
+  '#F0E442',
+  '#0072B2',
+  '#D55E00',
+  '#CC79A7',
+  '#999999',
 ]
 
 // Resolve against Vite's base so project-scoped hosting (GitHub Pages) works.
