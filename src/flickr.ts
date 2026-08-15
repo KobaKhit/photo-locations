@@ -37,7 +37,11 @@ const PIN_COLORS = [
   '#e879f9',
 ]
 
-const DATA_URL = '/data/photos-2026.json'
+// Resolve against Vite's base so project-scoped hosting (GitHub Pages) works.
+const DATA_URL = `${import.meta.env.BASE_URL}data/photos-2026.json`.replace(
+  /([^:]\/)\/+/g,
+  '$1',
+)
 
 /** Load previously downloaded Flickr points from disk (served via /public). */
 export async function loadDataset(): Promise<PhotoDataset> {
