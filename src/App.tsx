@@ -7,9 +7,12 @@ import {
   type MapPanRequest,
 } from './MapView'
 import {
+  applyPlaceLabels,
+  findPerCapitaHotspots,
   findHotspots,
   findMostViewed,
   loadDataset,
+  loadHotspotPlaceLabels,
   loadPopulationRates,
   resolvePlaceNames,
   type Hotspot,
@@ -21,6 +24,10 @@ import './App.css'
 export default function App() {
   const [points, setPoints] = useState<PhotoPoint[]>([])
   const [hotspots, setHotspots] = useState<Hotspot[]>([])
+  const [perCapitaHotspots, setPerCapitaHotspots] = useState<Hotspot[]>([])
+  const [metricMode, setMetricMode] = useState<
+    'photos' | 'population' | 'per-capita'
+  >('photos')
   const [populationRates, setPopulationRates] =
     useState<PopulationRateDataset | null>(null)
   const [meta, setMeta] = useState<{
@@ -33,6 +40,8 @@ export default function App() {
   const [hoverFocus, setHoverFocus] = useState<MapFocus | null>(null)
   const [selectedFocus, setSelectedFocus] = useState<MapFocus | null>(null)
   const [panRequest, setPanRequest] = useState<MapPanRequest | null>(null)
+  const [showHottestMarkers, setShowHottestMarkers] = useState(true)
+  const [showMostViewedMarkers, setShowMostViewedMarkers] = useState(true)
 
   useEffect(() => {
     let cancelled = false
@@ -48,19 +57,36 @@ export default function App() {
           estimatedTotal: data.estimatedTotal,
           downloadedAt: data.downloadedAt,
         })
+
+        const placeLabels = await loadHotspotPlaceLabels().catch(() => ({}))
+
         // This optional precomputed layer should never block the core map.
         loadPopulationRates()
           .then((rates) => {
-            if (!cancelled) setPopulationRates(rates)
+            if (cancelled) return
+            setPopulationRates(rates)
+            const rawPerCapitaHotspots = applyPlaceLabels(
+              findPerCapitaHotspots(data.points, rates, 12),
+              placeLabels,
+            )
+            setPerCapitaHotspots(rawPerCapitaHotspots)
+            resolvePlaceNames(rawPerCapitaHotspots).then((named) => {
+              if (!cancelled) {
+                setPerCapitaHotspots(applyPlaceLabels(named, placeLabels))
+              }
+            })
           })
           .catch((rateError) => {
             console.warn('Population-normalized grid unavailable', rateError)
           })
 
-        const rawHotspots = findHotspots(data.points, 12)
+        const rawHotspots = applyPlaceLabels(
+          findHotspots(data.points, 12),
+          placeLabels,
+        )
         setHotspots(rawHotspots)
         const named = await resolvePlaceNames(rawHotspots)
-        if (!cancelled) setHotspots(named)
+        if (!cancelled) setHotspots(applyPlaceLabels(named, placeLabels))
       } catch (e) {
         if (!cancelled) setError(e instanceof Error ? e.message : 'Failed to load photos')
       } finally {
@@ -73,6 +99,10 @@ export default function App() {
   }, [])
 
   const mostViewed = useMemo(() => findMostViewed(points, 7), [points])
+  const visibleHotspots =
+    metricMode === 'per-capita' ? perCapitaHotspots : hotspots
+  const hotspotTitle =
+    metricMode === 'per-capita' ? 'Highest per capita' : 'Hottest clusters'
 
   const asOfLabel = useMemo(() => {
     if (!meta?.downloadedAt) return null
@@ -118,7 +148,7 @@ export default function App() {
     <div className="app">
       <MapView
         points={points}
-        hotspots={hotspots}
+        hotspots={visibleHotspots}
         mostViewed={mostViewed}
         populationRates={populationRates}
         downloadedAt={meta?.downloadedAt}
@@ -126,6 +156,11 @@ export default function App() {
         selectedFocus={selectedFocus}
         panRequest={panRequest}
         onSelectFocus={selectFocus}
+        onMetricModeChange={setMetricMode}
+        showHottestMarkers={showHottestMarkers}
+        showMostViewedMarkers={showMostViewedMarkers}
+        onShowHottestMarkersChange={setShowHottestMarkers}
+        onShowMostViewedMarkersChange={setShowMostViewedMarkers}
       />
 
       <header className="hud">
@@ -152,41 +187,50 @@ export default function App() {
         </div>
       )}
 
-      {!loading && !error && hotspots.length > 0 && (
+      {!loading &&
+        !error &&
+        ((showHottestMarkers && visibleHotspots.length > 0) ||
+          (showMostViewedMarkers && mostViewed.length > 0)) && (
         <aside className="side-panels">
-          <section className="legend">
-            <p className="legend__title">Hottest clusters</p>
-            <ol className="legend__list">
-              {hotspots.slice(0, 7).map((h) => {
-                const id = `hotspot:${h.lat},${h.lon}`
-                const active = focus?.id === id
-                return (
-                  <li key={id}>
-                    <button
-                      type="button"
-                      className={`legend__item${active ? ' is-active' : ''}`}
-                      onMouseEnter={() => focusHotspot(h, false)}
-                      onMouseLeave={() => setHoverFocus(null)}
-                      onFocus={() => focusHotspot(h, false)}
-                      onBlur={() => setHoverFocus(null)}
-                      onClick={() => focusHotspot(h, true)}
-                    >
-                      <span
-                        className="legend__swatch"
-                        style={{ background: h.color }}
-                      />
-                      <span className="legend__name" title={h.placeName}>
-                        {h.placeName}
-                      </span>
-                      <span className="legend__count">{h.count}</span>
-                    </button>
-                  </li>
-                )
-              })}
-            </ol>
-          </section>
+          {showHottestMarkers && visibleHotspots.length > 0 && (
+            <section className="legend">
+              <p className="legend__title">{hotspotTitle}</p>
+              <ol className="legend__list">
+                {visibleHotspots.slice(0, 7).map((h) => {
+                  const id = `hotspot:${h.lat},${h.lon}`
+                  const active = focus?.id === id
+                  return (
+                    <li key={id}>
+                      <button
+                        type="button"
+                        className={`legend__item${active ? ' is-active' : ''}`}
+                        onMouseEnter={() => focusHotspot(h, false)}
+                        onMouseLeave={() => setHoverFocus(null)}
+                        onFocus={() => focusHotspot(h, false)}
+                        onBlur={() => setHoverFocus(null)}
+                        onClick={() => focusHotspot(h, true)}
+                      >
+                        <span
+                          className="legend__swatch"
+                          style={{ background: h.color }}
+                        />
+                        <span className="legend__name" title={h.placeName}>
+                          {h.placeName}
+                        </span>
+                        <span className="legend__count">
+                          {h.photosPerThousand === undefined
+                            ? h.count.toLocaleString()
+                            : `${h.photosPerThousand.toFixed(1)}/1k`}
+                        </span>
+                      </button>
+                    </li>
+                  )
+                })}
+              </ol>
+            </section>
+          )}
 
-          {mostViewed.length > 0 && (
+          {showMostViewedMarkers && mostViewed.length > 0 && (
             <section className="legend legend--views">
               <p className="legend__title">Most viewed</p>
               <ol className="legend__list legend__list--views">

@@ -12,6 +12,8 @@ export type Hotspot = {
   lat: number
   lon: number
   count: number
+  /** Present for population-normalized hotspot rankings. */
+  photosPerThousand?: number
   sample: PhotoPoint
   color: string
   /** City / region label from reverse geocoding */
@@ -64,6 +66,10 @@ const POPULATION_RATE_URL = `${import.meta.env.BASE_URL}data/photo-rates-per-cap
   /([^:]\/)\/+/g,
   '$1',
 )
+const HOTSPOT_PLACES_URL = `${import.meta.env.BASE_URL}data/hotspot-places-2026.json`.replace(
+  /([^:]\/)\/+/g,
+  '$1',
+)
 
 /** Load previously downloaded Flickr points from disk (served via /public). */
 export async function loadDataset(): Promise<PhotoDataset> {
@@ -84,6 +90,31 @@ export async function loadPopulationRates(): Promise<PopulationRateDataset> {
     throw new Error(`Failed to load population rate grid (HTTP ${res.status})`)
   }
   return (await res.json()) as PopulationRateDataset
+}
+
+export type HotspotPlaceLabels = Record<string, string | null>
+
+/** Offline Nominatim labels keyed by "lat.toFixed(3),lon.toFixed(3)". */
+export async function loadHotspotPlaceLabels(): Promise<HotspotPlaceLabels> {
+  const res = await fetch(HOTSPOT_PLACES_URL)
+  if (!res.ok) return {}
+  const data = (await res.json()) as { labels?: HotspotPlaceLabels }
+  return data.labels ?? {}
+}
+
+export function placeLabelKey(lat: number, lon: number): string {
+  return `${lat.toFixed(3)},${lon.toFixed(3)}`
+}
+
+/** Apply offline place names when present; leave coordinate fallback otherwise. */
+export function applyPlaceLabels(
+  hotspots: Hotspot[],
+  labels: HotspotPlaceLabels,
+): Hotspot[] {
+  return hotspots.map((hotspot) => {
+    const label = labels[placeLabelKey(hotspot.lat, hotspot.lon)]
+    return label ? { ...hotspot, placeName: label } : hotspot
+  })
 }
 
 /** Grid-cluster points; return the densest cells as pin hotspots, spread globally. */
@@ -135,6 +166,90 @@ export function findHotspots(points: PhotoPoint[], limit = 12, cellDeg = 1.5): H
   }))
 }
 
+/**
+ * Rank photography clusters by photos per 1,000 residents instead of raw count.
+ * Population and photos are aggregated into the same coarse cells used by
+ * findHotspots, then geographically spread so one region cannot fill the list.
+ */
+export function findPerCapitaHotspots(
+  points: PhotoPoint[],
+  populationRates: PopulationRateDataset,
+  limit = 12,
+  cellDeg = 1.5,
+): Hotspot[] {
+  type Cell = {
+    latSum: number
+    lonSum: number
+    count: number
+    population: number
+    best?: PhotoPoint
+  }
+  const cells = new Map<string, Cell>()
+  const keyFor = (lat: number, lon: number) =>
+    `${Math.floor(lat / cellDeg)},${Math.floor(lon / cellDeg)}`
+
+  for (const cell of populationRates.cells) {
+    const key = keyFor(cell.lat, cell.lon)
+    const existing = cells.get(key)
+    if (existing) {
+      existing.population += cell.population
+    } else {
+      cells.set(key, {
+        latSum: 0,
+        lonSum: 0,
+        count: 0,
+        population: cell.population,
+      })
+    }
+  }
+
+  for (const point of points) {
+    const key = keyFor(point.lat, point.lon)
+    const existing = cells.get(key)
+    if (!existing) continue
+    existing.latSum += point.lat
+    existing.lonSum += point.lon
+    existing.count += 1
+    if (!existing.best || point.views > existing.best.views) {
+      existing.best = point
+    }
+  }
+
+  const ranked = [...cells.values()]
+    .filter((cell): cell is Cell & { best: PhotoPoint } => cell.count > 0 && !!cell.best)
+    .map((cell) => ({
+      lat: cell.latSum / cell.count,
+      lon: cell.lonSum / cell.count,
+      count: cell.count,
+      photosPerThousand:
+        (cell.count * 1_000) /
+        Math.max(cell.population, populationRates.populationFloor),
+      sample: cell.best,
+    }))
+    .sort((a, b) => b.photosPerThousand - a.photosPerThousand)
+
+  const picked: typeof ranked = []
+  const minSepDeg = 12
+  for (const candidate of ranked) {
+    const tooClose = picked.some(
+      (item) => Math.hypot(item.lat - candidate.lat, item.lon - candidate.lon) < minSepDeg,
+    )
+    if (!tooClose) picked.push(candidate)
+    if (picked.length >= limit) break
+  }
+
+  for (const candidate of ranked) {
+    if (picked.length >= limit) break
+    if (!picked.includes(candidate)) picked.push(candidate)
+  }
+
+  return picked.map((cell, index) => ({
+    ...cell,
+    color: PIN_COLORS[index % PIN_COLORS.length],
+    placeName: formatCoords(cell.lat, cell.lon),
+  }))
+}
+
 /** Top photos by view count (unique ids). */
 export function findMostViewed(points: PhotoPoint[], limit = 8): PhotoPoint[] {
   return [...points].sort((a, b) => b.views - a.views).slice(0, limit)
@@ -151,6 +266,33 @@ type ReverseGeoResult = {
   locality?: string
   principalSubdivision?: string
   countryName?: string
+  continent?: string
+  localityInfo?: {
+    administrative?: Array<{ name?: string; description?: string; order?: number }>
+    informative?: Array<{ name?: string; description?: string; order?: number }>
+  }
+}
+
+function placeNameFromReverseGeo(data: ReverseGeoResult, fallback: string): string {
+  const admin = [...(data.localityInfo?.administrative ?? [])]
+    .filter((item) => item.name)
+    .sort((a, b) => (a.order ?? 99) - (b.order ?? 99))
+  const informative = [...(data.localityInfo?.informative ?? [])]
+    .filter((item) => item.name)
+    .sort((a, b) => (a.order ?? 99) - (b.order ?? 99))
+
+  const local =
+    data.city ||
+    data.locality ||
+    informative[0]?.name ||
+    admin[0]?.name
+  const region = data.principalSubdivision || admin[1]?.name || admin[0]?.name
+  const country = data.countryName || data.continent
+
+  const parts = [local, region === local ? country : region, country]
+    .filter(Boolean)
+    .filter((part, index, arr) => arr.indexOf(part) === index)
+  return parts.slice(0, 2).join(', ') || fallback
 }
 
 /** Resolve hotspot coordinates to city/region names (BigDataCloud, no API key). */
@@ -171,13 +313,7 @@ export async function resolvePlaceNames(hotspots: Hotspot[]): Promise<Hotspot[]>
         continue
       }
       const data = (await res.json()) as ReverseGeoResult
-      const placeName =
-        [data.city || data.locality, data.principalSubdivision, data.countryName]
-          .filter(Boolean)
-          .filter((part, i, arr) => arr.indexOf(part) === i)
-          .slice(0, 2)
-          .join(', ') || h.placeName
-      out.push({ ...h, placeName })
+      out.push({ ...h, placeName: placeNameFromReverseGeo(data, h.placeName) })
     } catch {
       out.push(h)
     }

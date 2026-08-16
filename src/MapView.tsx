@@ -38,6 +38,11 @@ type Props = {
   selectedFocus?: MapFocus | null
   panRequest?: MapPanRequest | null
   onSelectFocus?: (focus: MapFocus) => void
+  onMetricModeChange?: (metric: MetricMode) => void
+  showHottestMarkers?: boolean
+  showMostViewedMarkers?: boolean
+  onShowHottestMarkersChange?: (show: boolean) => void
+  onShowMostViewedMarkersChange?: (show: boolean) => void
 }
 
 export type MapFocusPhoto = {
@@ -70,13 +75,16 @@ export function flickrPhotoUrl(id: string): string {
 }
 
 export function focusFromHotspot(h: Hotspot): MapFocus {
+  const photosPerThousand = h.photosPerThousand
   return {
     id: `hotspot:${h.lat},${h.lon}`,
     lon: h.lon,
     lat: h.lat,
     label: h.placeName,
     color: h.color,
-    subtitle: `${h.count.toLocaleString()} photos in this area`,
+    subtitle: photosPerThousand !== undefined
+      ? `${photosPerThousand.toFixed(1)} photos per 1,000 residents`
+      : `${h.count.toLocaleString()} photos in this area`,
     photo: {
       id: h.sample.id,
       title: h.sample.title || 'Untitled',
@@ -680,13 +688,16 @@ export function MapView({
   selectedFocus = null,
   panRequest = null,
   onSelectFocus,
+  onMetricModeChange,
+  showHottestMarkers = true,
+  showMostViewedMarkers = true,
+  onShowHottestMarkersChange,
+  onShowMostViewedMarkersChange,
 }: Props) {
   const [viewMode, setViewMode] = useState<ViewMode>('hex')
   const [metricMode, setMetricMode] = useState<MetricMode>('photos')
   const [projectionMode, setProjectionMode] =
     useState<ProjectionMode>('mercator')
-  const [showHottestMarkers, setShowHottestMarkers] = useState(true)
-  const [showMostViewedMarkers, setShowMostViewedMarkers] = useState(true)
   const [exporting, setExporting] = useState(false)
   const legend = metricLegendLabels(metricMode)
 
@@ -789,7 +800,11 @@ export function MapView({
                 { value: 'per-capita', label: 'Capita' },
               ]}
               value={metricMode}
-              onChange={(value) => setMetricMode(value as MetricMode)}
+            onChange={(value) => {
+              const nextMetric = value as MetricMode
+              setMetricMode(nextMetric)
+              onMetricModeChange?.(nextMetric)
+            }}
             />
           )}
           <ToggleGroup
@@ -806,17 +821,23 @@ export function MapView({
             type="button"
             className={`marker-chip${showHottestMarkers ? ' is-active' : ''}`}
             aria-pressed={showHottestMarkers}
-            title="Toggle hottest cluster markers"
-            onClick={() => setShowHottestMarkers((v) => !v)}
+            title={
+              metricMode === 'per-capita'
+                ? 'Toggle highest per-capita cluster markers'
+                : 'Toggle hottest cluster markers'
+            }
+            onClick={() => onShowHottestMarkersChange?.(!showHottestMarkers)}
           >
-            Hottest
+            {metricMode === 'per-capita' ? 'Per capita' : 'Hottest'}
           </button>
           <button
             type="button"
             className={`marker-chip${showMostViewedMarkers ? ' is-active' : ''}`}
             aria-pressed={showMostViewedMarkers}
             title="Toggle most-viewed photo markers"
-            onClick={() => setShowMostViewedMarkers((v) => !v)}
+            onClick={() =>
+              onShowMostViewedMarkersChange?.(!showMostViewedMarkers)
+            }
           >
             Most viewed
           </button>
@@ -1834,7 +1855,10 @@ async function downloadHighResMap(
   )
 
   drawExportControls(context, width, options)
-  await drawExportPanels(context, width, height, hotspots, mostViewed)
+  await drawExportPanels(context, width, height, hotspots, mostViewed, {
+    showHottest: options.showHottestMarkers !== false,
+    showMostViewed: options.showMostViewedMarkers !== false,
+  })
   if (options.selectedFocus?.photo) {
     await drawExportPhotoPeek(context, height, options.selectedFocus)
   }
@@ -2225,6 +2249,7 @@ function drawExportControls(
     showMostViewedMarkers?: boolean
   },
 ) {
+  const normalizedHotspots = options.metricMode === 'per-capita'
   const x = width - 2100
   const y = 90
   const panelWidth = 1840
@@ -2266,7 +2291,7 @@ function drawExportControls(
     context,
     x + 1265,
     y + 38,
-    'HOTTEST',
+    normalizedHotspots ? 'PER CAPITA' : 'HOTTEST',
     ['Show', 'Hide'],
     options.showHottestMarkers === false ? 1 : 0,
     120,
@@ -2331,7 +2356,13 @@ async function drawExportPanels(
   height: number,
   hotspots: Hotspot[],
   mostViewed: PhotoPoint[],
+  options: { showHottest: boolean; showMostViewed: boolean },
 ) {
+  if (!options.showHottest && !options.showMostViewed) return
+
+  const normalizedHotspots = hotspots.some(
+    (hotspot) => hotspot.photosPerThousand !== undefined,
+  )
   const panelWidth = 1180
   const gap = 36
   const rowHeight = 78
@@ -2343,49 +2374,59 @@ async function drawExportPanels(
   const rightX = width - panelWidth - 160
   const leftX = rightX - panelWidth - gap
 
-  drawPanel(context, leftX, y, panelWidth, panelHeight)
-  drawPanel(context, rightX, y, panelWidth, panelHeight)
-
-  drawPanelTitle(context, 'HOTTEST CLUSTERS', leftX + padding, y + 62)
-  hotspots.slice(0, hotspotCount).forEach((hotspot, index) => {
-    const rowY = y + 125 + index * rowHeight
-    context.beginPath()
-    context.arc(leftX + padding + 12, rowY - 7, 12, 0, Math.PI * 2)
-    context.fillStyle = hotspot.color
-    context.fill()
-    drawPanelRow(
+  if (options.showHottest) {
+    drawPanel(context, leftX, y, panelWidth, panelHeight)
+    drawPanelTitle(
       context,
-      hotspot.placeName,
-      hotspot.count.toLocaleString(),
-      leftX + padding + 45,
-      rowY,
-      panelWidth - padding * 2 - 45,
+      normalizedHotspots ? 'HIGHEST PER CAPITA' : 'HOTTEST CLUSTERS',
+      leftX + padding,
+      y + 62,
     )
-  })
+    hotspots.slice(0, hotspotCount).forEach((hotspot, index) => {
+      const rowY = y + 125 + index * rowHeight
+      context.beginPath()
+      context.arc(leftX + padding + 12, rowY - 7, 12, 0, Math.PI * 2)
+      context.fillStyle = hotspot.color
+      context.fill()
+      drawPanelRow(
+        context,
+        hotspot.placeName,
+        normalizedHotspots
+          ? `${hotspot.photosPerThousand?.toFixed(1) ?? '0.0'}/1k`
+          : hotspot.count.toLocaleString(),
+        leftX + padding + 45,
+        rowY,
+        panelWidth - padding * 2 - 45,
+      )
+    })
+  }
 
-  drawPanelTitle(context, 'MOST VIEWED', rightX + padding, y + 62)
-  const bitmaps = await Promise.all(
-    mostViewed.slice(0, viewedCount).map((photo) => loadPhotoBitmap(photo.url)),
-  )
-  mostViewed.slice(0, viewedCount).forEach((photo, index) => {
-    const rowY = y + 125 + index * rowHeight
-    const bitmap = bitmaps[index]
-    if (bitmap) {
-      context.drawImage(bitmap, rightX + padding, rowY - 45, 58, 58)
-      bitmap.close()
-    } else {
-      context.fillStyle = '#20272d'
-      context.fillRect(rightX + padding, rowY - 45, 58, 58)
-    }
-    drawPanelRow(
-      context,
-      photo.title || 'Untitled',
-      photo.views.toLocaleString(),
-      rightX + padding + 82,
-      rowY,
-      panelWidth - padding * 2 - 82,
+  if (options.showMostViewed) {
+    drawPanel(context, rightX, y, panelWidth, panelHeight)
+    drawPanelTitle(context, 'MOST VIEWED', rightX + padding, y + 62)
+    const bitmaps = await Promise.all(
+      mostViewed.slice(0, viewedCount).map((photo) => loadPhotoBitmap(photo.url)),
     )
-  })
+    mostViewed.slice(0, viewedCount).forEach((photo, index) => {
+      const rowY = y + 125 + index * rowHeight
+      const bitmap = bitmaps[index]
+      if (bitmap) {
+        context.drawImage(bitmap, rightX + padding, rowY - 45, 58, 58)
+        bitmap.close()
+      } else {
+        context.fillStyle = '#20272d'
+        context.fillRect(rightX + padding, rowY - 45, 58, 58)
+      }
+      drawPanelRow(
+        context,
+        photo.title || 'Untitled',
+        photo.views.toLocaleString(),
+        rightX + padding + 82,
+        rowY,
+        panelWidth - padding * 2 - 82,
+      )
+    })
+  }
 }
 
 function drawPanel(

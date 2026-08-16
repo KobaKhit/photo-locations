@@ -21,6 +21,7 @@ public/data/*.tmp
 !public/data/.gitkeep
 !public/data/photos-2026.json
 !public/data/photo-rates-per-capita-2026.json
+!public/data/hotspot-places-2026.json
 
 # Editor directories and files
 .vscode/*

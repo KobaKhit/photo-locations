@@ -6,6 +6,7 @@
   "scripts": {
     "download": "node scripts/download.mjs",
     "population": "node scripts/prepare-population.mjs",
+    "hotspot-places": "node scripts/resolve-hotspot-places.mjs",
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "oxlint",

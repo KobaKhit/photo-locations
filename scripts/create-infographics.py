@@ -2,6 +2,9 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
+# Allow full 8K × 3-panel canvases.
+Image.MAX_IMAGE_PIXELS = 200_000_000
+
 
 # Full 8K exports from the app (not chat thumbnails).
 SOURCE_DIR = Path(r"C:\Users\kobak\Downloads")
@@ -155,7 +158,7 @@ points_panels = [
     (
         "World population",
         "GHSL resident population (2020)",
-        source("flickr-2026-points-population-equal-earth-8k (1).png"),
+        source("flickr-2026-points-population-equal-earth-8k.png"),
     ),
 ]
 
