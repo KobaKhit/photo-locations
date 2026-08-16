@@ -1,7 +1,6 @@
 import { useMemo, useState, useCallback, useEffect } from 'react'
 import DeckGL from '@deck.gl/react'
 import { PolygonLayer, ScatterplotLayer } from '@deck.gl/layers'
-import { HexagonLayer } from '@deck.gl/aggregation-layers'
 import { Map as MapLibreMap } from 'react-map-gl/maplibre'
 import {
   COORDINATE_SYSTEM,
@@ -23,12 +22,17 @@ import countries110m from 'world-atlas/countries-110m.json'
 import type { FeatureCollection, MultiPolygon, Polygon } from 'geojson'
 import type { GeometryCollection, Topology } from 'topojson-specification'
 import 'maplibre-gl/dist/maplibre-gl.css'
-import type { Hotspot, PhotoPoint } from './flickr'
+import type {
+  Hotspot,
+  PhotoPoint,
+  PopulationRateDataset,
+} from './flickr'
 
 type Props = {
   points: PhotoPoint[]
   hotspots: Hotspot[]
   mostViewed: PhotoPoint[]
+  populationRates: PopulationRateDataset | null
   downloadedAt?: string
   focus?: MapFocus | null
   selectedFocus?: MapFocus | null
@@ -145,16 +149,60 @@ const BASEMAP = {
   ],
 }
 
-type DisplayMode = 'hex' | 'points'
+type ViewMode = 'hex' | 'points'
+type MetricMode = 'photos' | 'population' | 'per-capita'
 type ProjectionMode = 'mercator' | 'equal-earth'
 type XY = [number, number]
 type Rgba = [number, number, number, number]
 type ProjectedPoint = { source: PhotoPoint; position: XY; color: Rgba }
 type ProjectedHotspot = { source: Hotspot; position: XY }
-type EqualEarthBin = {
-  polygon: XY[]
-  count: number
-  color: Rgba
+type MetricField = 'photos' | 'population' | 'photosPerThousand'
+
+function metricField(metric: MetricMode): MetricField {
+  if (metric === 'population') return 'population'
+  if (metric === 'per-capita') return 'photosPerThousand'
+  return 'photos'
+}
+
+function cellCenterKey(lat: number, lon: number, cellDegrees: number): string {
+  const cy =
+    Math.floor(lat / cellDegrees) * cellDegrees + cellDegrees / 2
+  const cx =
+    Math.floor(lon / cellDegrees) * cellDegrees + cellDegrees / 2
+  return `${cy.toFixed(3)},${cx.toFixed(3)}`
+}
+
+function metricLegendLabels(metric: MetricMode): {
+  title: string
+  low: string
+  high: string
+} {
+  if (metric === 'population') {
+    return { title: 'Population', low: 'Low', high: 'High' }
+  }
+  if (metric === 'per-capita') {
+    return { title: 'Per capita', low: 'Low', high: 'High' }
+  }
+  return { title: 'Density', low: 'Low', high: 'High' }
+}
+
+function metricHint(viewMode: ViewMode, metric: MetricMode): string {
+  if (viewMode === 'hex') {
+    if (metric === 'population') {
+      return 'Shared hex grid · GHSL resident population (2020)'
+    }
+    if (metric === 'per-capita') {
+      return 'Same hexes · photos per 1,000 residents'
+    }
+    return 'Same hexes · brighter = more photos'
+  }
+  if (metric === 'population') {
+    return 'One point per 0.25° cell · GHSL resident population (2020)'
+  }
+  if (metric === 'per-capita') {
+    return 'Points colored by photos per 1,000 residents · GHSL 2020'
+  }
+  return 'Points · amber→hot · brighter = denser area'
 }
 
 /**
@@ -215,11 +263,322 @@ function buildPointDensityColors(
   })
 }
 
+function colorFromMetricValue(value: number, cap: number): Rgba {
+  const normalized = Math.log1p(Math.min(value, cap)) / Math.log1p(cap)
+  const colorIndex = Math.min(
+    DENSITY_COLORS.length - 1,
+    Math.floor(normalized * DENSITY_COLORS.length),
+  )
+  return DENSITY_COLORS[colorIndex]
+}
+
+function cellsForMetric(
+  dataset: PopulationRateDataset,
+  metric: MetricMode,
+) {
+  // Shared 0.25° tessellation for every hex metric. World pop uses the full
+  // inhabited grid; photo count and per-capita share the photographed cells.
+  if (metric === 'population') return dataset.cells
+  return dataset.cells.filter((cell) => cell.photos > 0)
+}
+
+function metricCap(
+  dataset: PopulationRateDataset,
+  field: MetricField,
+  metric: MetricMode,
+): number {
+  const sorted = cellsForMetric(dataset, metric)
+    .map((cell) => cell[field])
+    .sort((a, b) => a - b)
+  return sorted[Math.floor(sorted.length * 0.97)] ?? 1
+}
+
+/**
+ * Shared hex tessellation for every metric. Photos and population are binned
+ * into the same hexes so switching metric only changes the color, never the
+ * geometry. Population lands via 2×2 sub-samples of each source cell so hexes
+ * fill evenly instead of catching one centroid each.
+ */
+const HEX_SCREEN_RADIUS = 4.2
+const HEX_COVERAGE = 0.94
+const SQRT3 = Math.sqrt(3)
+
+type HexAggregates = {
+  radius: number
+  q: number[]
+  r: number[]
+  photos: number[]
+  population: number[]
+}
+
+type MetricHex = {
+  polygon: [number, number][]
+  color: Rgba
+}
+
+/** Hex radius in binning-space units, floored at the population grain. */
+function hexRadius(
+  unitsPerDegree: number,
+  zoom: number,
+  cellDegrees: number,
+): number {
+  const screenRadius = HEX_SCREEN_RADIUS / 2 ** zoom
+  return Math.max(screenRadius, cellDegrees * unitsPerDegree)
+}
+
+/**
+ * Past this on-screen resolution a 0.25° hex is wider than the interesting
+ * detail, so hex view hands off to the individual photos instead.
+ */
+const HEX_DETAIL_PIXELS_PER_DEGREE = 150
+
+function isBeyondHexDetail(
+  unitsPerDegree: number,
+  zoom: number,
+  cellDegrees: number,
+): boolean {
+  if (!cellDegrees) return false
+  return unitsPerDegree * 2 ** zoom > HEX_DETAIL_PIXELS_PER_DEGREE
+}
+
+function toFlatPositions(
+  points: PhotoPoint[],
+  toSpace: (lon: number, lat: number) => XY,
+): Float64Array {
+  const out = new Float64Array(points.length * 2)
+  for (let i = 0; i < points.length; i += 1) {
+    const [x, y] = toSpace(points[i].lon, points[i].lat)
+    out[i * 2] = x
+    out[i * 2 + 1] = y
+  }
+  return out
+}
+
+/** Flat [x, y, population] triples, 2×2 sub-samples per source cell. */
+function toFlatPopulationSamples(
+  dataset: PopulationRateDataset | null,
+  toSpace: (lon: number, lat: number) => XY,
+): Float64Array | null {
+  if (!dataset) return null
+  const offset = dataset.cellDegrees / 4
+  const out = new Float64Array(dataset.cells.length * 4 * 3)
+  let at = 0
+  for (const cell of dataset.cells) {
+    const share = cell.population / 4
+    for (const dLon of [-offset, offset]) {
+      for (const dLat of [-offset, offset]) {
+        const [x, y] = toSpace(cell.lon + dLon, cell.lat + dLat)
+        out[at] = x
+        out[at + 1] = y
+        out[at + 2] = share
+        at += 3
+      }
+    }
+  }
+  return out
+}
+
+function aggregateHexes(
+  radius: number,
+  photoPositions: Float64Array,
+  populationSamples: Float64Array | null,
+): HexAggregates {
+  const index = new Map<number, number>()
+  const q: number[] = []
+  const r: number[] = []
+  const photos: number[] = []
+  const population: number[] = []
+
+  // Pointy-top axial coordinates, rounded through cube space. Returns -1 for
+  // samples the projection dropped (clipped or undefined).
+  const binAt = (x: number, y: number): number => {
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return -1
+    const fq = ((SQRT3 / 3) * x - y / 3) / radius
+    const fr = ((2 / 3) * y) / radius
+    const fy = -fq - fr
+    let rx = Math.round(fq)
+    let ry = Math.round(fy)
+    let rz = Math.round(fr)
+    const dx = Math.abs(rx - fq)
+    const dy = Math.abs(ry - fy)
+    const dz = Math.abs(rz - fr)
+    if (dx > dy && dx > dz) rx = -ry - rz
+    else if (dy > dz) ry = -rx - rz
+    else rz = -rx - ry
+
+    const key = (rx + 1e6) * 4e6 + (rz + 1e6)
+    let at = index.get(key)
+    if (at === undefined) {
+      at = q.length
+      index.set(key, at)
+      q.push(rx)
+      r.push(rz)
+      photos.push(0)
+      population.push(0)
+    }
+    return at
+  }
+
+  for (let i = 0; i < photoPositions.length; i += 2) {
+    const at = binAt(photoPositions[i], photoPositions[i + 1])
+    if (at >= 0) photos[at] += 1
+  }
+  if (populationSamples) {
+    for (let i = 0; i < populationSamples.length; i += 3) {
+      const at = binAt(populationSamples[i], populationSamples[i + 1])
+      if (at >= 0) population[at] += populationSamples[i + 2]
+    }
+  }
+
+  return { radius, q, r, photos, population }
+}
+
+function buildMetricHexes(
+  aggregates: HexAggregates,
+  metric: MetricMode,
+  populationFloor: number,
+  toVertex: (x: number, y: number) => [number, number],
+): MetricHex[] {
+  const { radius, q, r, photos, population } = aggregates
+  const keep: number[] = []
+  const values: number[] = []
+
+  for (let i = 0; i < q.length; i += 1) {
+    // World pop covers every inhabited hex; the photo metrics need photos.
+    if (metric === 'population') {
+      if (population[i] <= 0) continue
+      keep.push(i)
+      values.push(population[i])
+      continue
+    }
+    if (photos[i] <= 0) continue
+    keep.push(i)
+    values.push(
+      metric === 'per-capita'
+        ? (photos[i] * 1_000) / Math.max(population[i], populationFloor)
+        : photos[i],
+    )
+  }
+
+  const sorted = [...values].sort((a, b) => a - b)
+  const cap = sorted[Math.floor(sorted.length * 0.97)] ?? 1
+
+  return keep.map((i, n) => {
+    const cx = radius * SQRT3 * (q[i] + r[i] / 2)
+    const cy = radius * 1.5 * r[i]
+    const polygon = Array.from({ length: 6 }, (_, v) => {
+      const angle = ((60 * v - 30) * Math.PI) / 180
+      return toVertex(
+        cx + radius * HEX_COVERAGE * Math.cos(angle),
+        cy + radius * HEX_COVERAGE * Math.sin(angle),
+      )
+    })
+    return { polygon, color: colorFromMetricValue(values[n], cap) }
+  })
+}
+
+/** Web Mercator world space (512 units at zoom 0) — zoom independent. */
+const MERCATOR_WORLD = 512
+const MERCATOR_UNITS_PER_DEGREE = MERCATOR_WORLD / 360
+const MERCATOR_MAX_LAT = 85.051129
+
+function toMercatorWorld(lon: number, lat: number): XY {
+  const clamped = Math.max(-MERCATOR_MAX_LAT, Math.min(MERCATOR_MAX_LAT, lat))
+  const phi = (clamped * Math.PI) / 180
+  return [
+    ((lon + 180) / 360) * MERCATOR_WORLD,
+    (0.5 - Math.log(Math.tan(Math.PI / 4 + phi / 2)) / (2 * Math.PI)) *
+      MERCATOR_WORLD,
+  ]
+}
+
+function fromMercatorWorld(x: number, y: number): [number, number] {
+  const n = Math.PI * (1 - (2 * y) / MERCATOR_WORLD)
+  return [
+    (x / MERCATOR_WORLD) * 360 - 180,
+    (180 / Math.PI) * Math.atan(Math.sinh(n)),
+  ]
+}
+
+/** Color photo points by the selected population-grid metric. */
+function buildPointMetricColors(
+  points: PhotoPoint[],
+  dataset: PopulationRateDataset | null,
+  metric: MetricMode,
+): Rgba[] {
+  if (!dataset || metric === 'photos') {
+    return buildPointDensityColors(points)
+  }
+
+  const field = metricField(metric)
+  const cap = metricCap(dataset, field, metric)
+  const lookup = new Map<string, number>()
+  for (const cell of cellsForMetric(dataset, metric)) {
+    lookup.set(cellCenterKey(cell.lat, cell.lon, dataset.cellDegrees), cell[field])
+  }
+
+  return points.map((point) => {
+    const value =
+      lookup.get(cellCenterKey(point.lat, point.lon, dataset.cellDegrees)) ?? 0
+    return colorFromMetricValue(Math.max(value, 0), cap)
+  })
+}
+
+/** One colored dot per inhabited cell — Points view for World pop. */
+function buildPopulationPointColors(
+  dataset: PopulationRateDataset | null,
+): Rgba[] {
+  if (!dataset) return []
+  const cap = metricCap(dataset, 'population', 'population')
+  // Opaque + lifted low end so sparse regions don't vanish into black land.
+  return dataset.cells.map((cell) => {
+    const [r, g, b] = colorFromMetricValue(cell.population, cap)
+    return [
+      Math.min(255, Math.round(r + (255 - r) * 0.12)),
+      Math.min(255, Math.round(g + (255 - g) * 0.1)),
+      Math.min(255, Math.round(b + (255 - b) * 0.08)),
+      255,
+    ]
+  })
+}
+
+/**
+ * Break the regular 0.25° lattice so Equal Earth / Mercator don't show
+ * dark horizontal scanlines between latitude rows.
+ */
+function jitterCellCenter(
+  lat: number,
+  lon: number,
+  cellDegrees: number,
+): [number, number] {
+  const hash = Math.sin(lat * 12.9898 + lon * 78.233) * 43758.5453
+  const u = hash - Math.floor(hash)
+  const v = hash * 7.13 - Math.floor(hash * 7.13)
+  const amp = cellDegrees * 0.42
+  return [lon + (u - 0.5) * 2 * amp, lat + (v - 0.5) * 2 * amp]
+}
+
+/** Screen radius that nearly fills one population cell at the current zoom. */
+function populationPointRadiusPx(
+  unitsPerDegree: number,
+  zoom: number,
+  cellDegrees: number,
+): number {
+  const cellPx = cellDegrees * unitsPerDegree * 2 ** zoom
+  // Overlap neighbors so latitude rows don't leave dark bands.
+  return Math.max(1.4, cellPx * 0.72)
+}
+
 const equalEarth = geoEqualEarth().scale(140).translate([0, 0])
 
 function project(lon: number, lat: number): XY {
   return equalEarth([lon, lat]) as XY
 }
+
+/** Projected world units per degree of longitude at the equator. */
+const EQUAL_EARTH_UNITS_PER_DEGREE = Math.abs(
+  project(1, 0)[0] - project(0, 0)[0],
+)
 
 const WORLD_COUNTRIES = (() => {
   const topology = countries110m as unknown as Topology<{
@@ -231,23 +590,72 @@ const WORLD_COUNTRIES = (() => {
   ) as FeatureCollection<Polygon | MultiPolygon>
 })()
 
+/**
+ * Cut a ring wherever it jumps the antimeridian. Without this, Russia, Fiji
+ * and Antarctica project into straight bands spanning the whole map.
+ */
+function splitRingAtAntimeridian(
+  ring: [number, number][],
+): [number, number][][] {
+  const last = ring[ring.length - 1]
+  const isClosed =
+    ring.length > 1 && last[0] === ring[0][0] && last[1] === ring[0][1]
+  const vertices = isClosed ? ring.slice(0, -1) : ring
+  if (vertices.length < 3) return [ring]
+
+  const parts: [number, number][][] = []
+  let current: [number, number][] = [vertices[0]]
+
+  // Includes the implicit closing edge, which is itself often the seam.
+  for (let i = 1; i <= vertices.length; i += 1) {
+    const previous = vertices[i - 1]
+    const point = vertices[i % vertices.length]
+    if (Math.abs(point[0] - previous[0]) <= 180) {
+      current.push(point)
+      continue
+    }
+
+    // Walk each side out to its own edge of the dateline so both halves
+    // close along the meridian instead of streaking across the map.
+    const goingEast = previous[0] > 0
+    const edge = goingEast ? 180 : -180
+    const unwrappedLon = point[0] + (goingEast ? 360 : -360)
+    const span = unwrappedLon - previous[0]
+    // Rings that already carry vertices on both sides of the dateline give a
+    // zero-length span; interpolating there would yield NaN vertices.
+    const t = span === 0 ? 0 : (edge - previous[0]) / span
+    const seamLat = previous[1] + t * (point[1] - previous[1])
+    current.push([edge, seamLat])
+    parts.push(current)
+    current = [[-edge, seamLat], point]
+  }
+
+  if (parts.length === 0) return [vertices]
+  // The trailing run wraps around to where the first part started.
+  parts[0] = [...current.slice(0, -1), ...parts[0]]
+  return parts
+}
+
 function buildWorldPolygons(): XY[][][] {
   const polygons: XY[][][] = []
 
+  // Every ring becomes its own polygon: land is a single flat color, so
+  // dropping hole semantics costs nothing and keeps split rings closed.
+  const addRings = (rings: [number, number][][]) => {
+    for (const ring of rings) {
+      for (const part of splitRingAtAntimeridian(ring)) {
+        if (part.length < 3) continue
+        polygons.push([part.map(([lon, lat]) => project(lon, lat))])
+      }
+    }
+  }
+
   for (const country of WORLD_COUNTRIES.features) {
     if (country.geometry.type === 'Polygon') {
-      polygons.push(
-        country.geometry.coordinates.map((ring) =>
-          ring.map(([lon, lat]) => project(lon, lat)),
-        ),
-      )
+      addRings(country.geometry.coordinates as [number, number][][])
     } else {
       for (const polygon of country.geometry.coordinates) {
-        polygons.push(
-          polygon.map((ring) =>
-            ring.map(([lon, lat]) => project(lon, lat)),
-          ),
-        )
+        addRings(polygon as [number, number][][])
       }
     }
   }
@@ -255,76 +663,6 @@ function buildWorldPolygons(): XY[][][] {
 }
 
 const WORLD_POLYGONS = buildWorldPolygons()
-
-function buildEqualEarthBins(
-  points: ProjectedPoint[],
-  radius = 2.2,
-): EqualEarthBin[] {
-  type Bin = { q: number; r: number; count: number }
-  const bins = new Map<string, Bin>()
-  const sqrt3 = Math.sqrt(3)
-
-  // Pointy-top axial hex coordinates, rounded through cube space.
-  for (const point of points) {
-    const [x, y] = point.position
-    const q = (sqrt3 / 3 * x - y / 3) / radius
-    const r = (2 / 3 * y) / radius
-    const cubeX = q
-    const cubeZ = r
-    const cubeY = -cubeX - cubeZ
-    let rx = Math.round(cubeX)
-    let ry = Math.round(cubeY)
-    let rz = Math.round(cubeZ)
-    const dx = Math.abs(rx - cubeX)
-    const dy = Math.abs(ry - cubeY)
-    const dz = Math.abs(rz - cubeZ)
-    if (dx > dy && dx > dz) rx = -ry - rz
-    else if (dy > dz) ry = -rx - rz
-    else rz = -rx - ry
-
-    const key = `${rx},${rz}`
-    const bin = bins.get(key)
-    if (bin) bin.count += 1
-    else bins.set(key, { q: rx, r: rz, count: 1 })
-  }
-
-  const counts = [...bins.values()]
-    .map((bin) => bin.count)
-    .sort((a, b) => a - b)
-  const cap = counts[Math.floor(counts.length * 0.97)] ?? 1
-
-  return [...bins.values()].map((bin) => {
-    const cx = radius * sqrt3 * (bin.q + bin.r / 2)
-    const cy = radius * 1.5 * bin.r
-    const polygon = Array.from({ length: 6 }, (_, i): XY => {
-      const angle = ((60 * i - 30) * Math.PI) / 180
-      return [
-        cx + radius * 0.91 * Math.cos(angle),
-        cy + radius * 0.91 * Math.sin(angle),
-      ]
-    })
-    const normalized =
-      Math.log1p(Math.min(bin.count, cap)) / Math.log1p(cap)
-    const colorIndex = Math.min(
-      DENSITY_COLORS.length - 1,
-      Math.floor(normalized * DENSITY_COLORS.length),
-    )
-    return {
-      polygon,
-      count: bin.count,
-      color: DENSITY_COLORS[colorIndex],
-    }
-  })
-}
-
-/** Hex radius in meters — tighter as you zoom in. */
-function hexRadiusMeters(zoom: number): number {
-  if (zoom < 2.5) return 90000
-  if (zoom < 4) return 45000
-  if (zoom < 5.5) return 20000
-  if (zoom < 7) return 8000
-  return 3000
-}
 
 type HoverInfo = {
   x: number
@@ -336,16 +674,21 @@ export function MapView({
   points,
   hotspots,
   mostViewed,
+  populationRates,
   downloadedAt,
   focus = null,
   selectedFocus = null,
   panRequest = null,
   onSelectFocus,
 }: Props) {
-  const [displayMode, setDisplayMode] = useState<DisplayMode>('hex')
+  const [viewMode, setViewMode] = useState<ViewMode>('hex')
+  const [metricMode, setMetricMode] = useState<MetricMode>('photos')
   const [projectionMode, setProjectionMode] =
     useState<ProjectionMode>('mercator')
+  const [showHottestMarkers, setShowHottestMarkers] = useState(true)
+  const [showMostViewedMarkers, setShowMostViewedMarkers] = useState(true)
   const [exporting, setExporting] = useState(false)
+  const legend = metricLegendLabels(metricMode)
 
   const exportHighRes = useCallback(async () => {
     if (exporting || points.length === 0) return
@@ -355,10 +698,14 @@ export function MapView({
         requestAnimationFrame(() => resolve()),
       )
       await downloadHighResMap(points, hotspots, mostViewed, {
-        displayMode,
+        viewMode,
+        metricMode,
         projectionMode,
         downloadedAt,
         selectedFocus,
+        populationRates,
+        showHottestMarkers,
+        showMostViewedMarkers,
       })
     } catch (error) {
       console.error('High-resolution export failed', error)
@@ -367,14 +714,18 @@ export function MapView({
       setExporting(false)
     }
   }, [
-    displayMode,
+    viewMode,
+    metricMode,
     downloadedAt,
     exporting,
     hotspots,
     mostViewed,
     points,
     projectionMode,
+    populationRates,
     selectedFocus,
+    showHottestMarkers,
+    showMostViewedMarkers,
   ])
 
   return (
@@ -383,7 +734,12 @@ export function MapView({
         <MercatorMap
           points={points}
           hotspots={hotspots}
-          displayMode={displayMode}
+          mostViewed={mostViewed}
+          populationRates={populationRates}
+          viewMode={viewMode}
+          metricMode={metricMode}
+          showHottestMarkers={showHottestMarkers}
+          showMostViewedMarkers={showMostViewedMarkers}
           focus={focus}
           panRequest={panRequest}
           onSelectFocus={onSelectFocus}
@@ -392,7 +748,12 @@ export function MapView({
         <EqualEarthMap
           points={points}
           hotspots={hotspots}
-          displayMode={displayMode}
+          mostViewed={mostViewed}
+          populationRates={populationRates}
+          viewMode={viewMode}
+          metricMode={metricMode}
+          showHottestMarkers={showHottestMarkers}
+          showMostViewedMarkers={showMostViewedMarkers}
           focus={focus}
           panRequest={panRequest}
           onSelectFocus={onSelectFocus}
@@ -407,35 +768,70 @@ export function MapView({
       )}
 
       <div className="map-controls" aria-label="Map display controls">
-        <ToggleGroup
-          label="View"
-          options={[
-            { value: 'hex', label: 'Hex density' },
-            { value: 'points', label: 'Points' },
-          ]}
-          value={displayMode}
-          onChange={(value) => setDisplayMode(value as DisplayMode)}
-        />
-        <ToggleGroup
-          label="Projection"
-          options={[
-            { value: 'mercator', label: 'Mercator' },
-            { value: 'equal-earth', label: 'Equal Earth' },
-          ]}
-          value={projectionMode}
-          onChange={(value) => setProjectionMode(value as ProjectionMode)}
-        />
-        <button
-          type="button"
-          className="export-button"
-          onClick={exportHighRes}
-          disabled={exporting || points.length === 0}
-          title="Download an 8K PNG matching the selected view and projection"
-        >
-          {exporting ? 'Rendering…' : 'Export 8K'}
-        </button>
+        <div className="map-controls__row">
+          <ToggleGroup
+            label="View"
+            compact
+            options={[
+              { value: 'hex', label: 'Hex' },
+              { value: 'points', label: 'Points' },
+            ]}
+            value={viewMode}
+            onChange={(value) => setViewMode(value as ViewMode)}
+          />
+          {populationRates && (
+            <ToggleGroup
+              label="Metric"
+              compact
+              options={[
+                { value: 'photos', label: 'Photos' },
+                { value: 'population', label: 'Pop' },
+                { value: 'per-capita', label: 'Capita' },
+              ]}
+              value={metricMode}
+              onChange={(value) => setMetricMode(value as MetricMode)}
+            />
+          )}
+          <ToggleGroup
+            label="Projection"
+            compact
+            options={[
+              { value: 'mercator', label: 'Mercator' },
+              { value: 'equal-earth', label: 'Equal Earth' },
+            ]}
+            value={projectionMode}
+            onChange={(value) => setProjectionMode(value as ProjectionMode)}
+          />
+          <button
+            type="button"
+            className={`marker-chip${showHottestMarkers ? ' is-active' : ''}`}
+            aria-pressed={showHottestMarkers}
+            title="Toggle hottest cluster markers"
+            onClick={() => setShowHottestMarkers((v) => !v)}
+          >
+            Hottest
+          </button>
+          <button
+            type="button"
+            className={`marker-chip${showMostViewedMarkers ? ' is-active' : ''}`}
+            aria-pressed={showMostViewedMarkers}
+            title="Toggle most-viewed photo markers"
+            onClick={() => setShowMostViewedMarkers((v) => !v)}
+          >
+            Most viewed
+          </button>
+          <button
+            type="button"
+            className="export-button"
+            onClick={exportHighRes}
+            disabled={exporting || points.length === 0}
+            title="Download an 8K PNG matching the selected view and projection"
+          >
+            {exporting ? 'Rendering…' : 'Export 8K'}
+          </button>
+        </div>
         <div className="density-legend" aria-hidden="true">
-          <span className="density-legend__label">Density</span>
+          <span className="density-legend__label">{legend.title}</span>
           <div
             className="density-legend__ramp"
             style={{
@@ -445,19 +841,16 @@ export function MapView({
             }}
           />
           <div className="density-legend__ends">
-            <span>Low</span>
-            <span>High</span>
+            <span>{legend.low}</span>
+            <span>{legend.high}</span>
           </div>
         </div>
       </div>
 
-      <p className="map-hint">
-        {displayMode === 'hex'
-          ? 'Hex density · Inferno scale · brighter = more photos'
-          : 'Points · amber→hot · brighter = denser area'}
-      </p>
+      <p className="map-hint">{metricHint(viewMode, metricMode)}</p>
       <p className="map-credit">
         Built by kobakhit · © Natural Earth · © OSM · © CARTO · Flickr · deck.gl
+        · population: GHSL GHS-POP R2023A (EC JRC)
       </p>
     </div>
   )
@@ -465,9 +858,18 @@ export function MapView({
 
 type MapModeProps = Pick<
   Props,
-  'points' | 'hotspots' | 'focus' | 'panRequest' | 'onSelectFocus'
+  | 'points'
+  | 'hotspots'
+  | 'mostViewed'
+  | 'populationRates'
+  | 'focus'
+  | 'panRequest'
+  | 'onSelectFocus'
 > & {
-  displayMode: DisplayMode
+  viewMode: ViewMode
+  metricMode: MetricMode
+  showHottestMarkers: boolean
+  showMostViewedMarkers: boolean
 }
 
 function focusFillColor(focus: MapFocus): Rgba {
@@ -526,14 +928,91 @@ function buildFocusLayers(
 function MercatorMap({
   points,
   hotspots,
-  displayMode,
+  mostViewed,
+  populationRates,
+  viewMode,
+  metricMode,
+  showHottestMarkers,
+  showMostViewedMarkers,
   focus,
   panRequest,
   onSelectFocus,
 }: MapModeProps) {
   const [viewState, setViewState] = useState<MapViewState>(INITIAL_VIEW)
   const [hover, setHover] = useState<HoverInfo>(null)
-  const pointColors = useMemo(() => buildPointDensityColors(points), [points])
+  const pointColors = useMemo(
+    () => buildPointMetricColors(points, populationRates, metricMode),
+    [points, populationRates, metricMode],
+  )
+  const populationPointColors = useMemo(
+    () => buildPopulationPointColors(populationRates),
+    [populationRates],
+  )
+  const populationPointPositions = useMemo(() => {
+    if (!populationRates) return [] as [number, number][]
+    const cellDeg = populationRates.cellDegrees
+    return populationRates.cells.map(
+      (cell) => jitterCellCenter(cell.lat, cell.lon, cellDeg),
+    )
+  }, [populationRates])
+  const populationPointRadius = useMemo(
+    () =>
+      populationPointRadiusPx(
+        MERCATOR_UNITS_PER_DEGREE,
+        viewState.zoom,
+        populationRates?.cellDegrees ?? 0.25,
+      ),
+    [populationRates?.cellDegrees, viewState.zoom],
+  )
+  const photoWorldPositions = useMemo(
+    () => toFlatPositions(points, toMercatorWorld),
+    [points],
+  )
+  const populationWorldSamples = useMemo(
+    () => toFlatPopulationSamples(populationRates, toMercatorWorld),
+    [populationRates],
+  )
+  // Quantized so panning/zooming doesn't re-bin a million samples every frame.
+  const hexAggregates = useMemo(() => {
+    const zoomStep = Math.round(viewState.zoom * 2) / 2
+    const radius = hexRadius(
+      MERCATOR_UNITS_PER_DEGREE,
+      zoomStep,
+      populationRates?.cellDegrees ?? 0,
+    )
+    return aggregateHexes(radius, photoWorldPositions, populationWorldSamples)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    photoWorldPositions,
+    populationWorldSamples,
+    populationRates?.cellDegrees,
+    Math.round(viewState.zoom * 2) / 2,
+  ])
+  const metricHexes = useMemo(
+    () =>
+      buildMetricHexes(
+        hexAggregates,
+        metricMode,
+        populationRates?.populationFloor ?? 1_000,
+        fromMercatorWorld,
+      ),
+    [hexAggregates, metricMode, populationRates?.populationFloor],
+  )
+  // Hexes only in hex view (until deep zoom). Points view always shows points —
+  // World pop uses one dot per inhabited cell (also used as the hex handoff).
+  const beyondHexDetail = isBeyondHexDetail(
+    MERCATOR_UNITS_PER_DEGREE,
+    viewState.zoom,
+    populationRates?.cellDegrees ?? 0,
+  )
+  const showHexes = viewMode === 'hex' && !beyondHexDetail
+  const showPhotoPoints =
+    metricMode !== 'population' &&
+    (viewMode === 'points' || beyondHexDetail)
+  const showPopulationPoints =
+    metricMode === 'population' &&
+    !!populationRates &&
+    (viewMode === 'points' || beyondHexDetail)
 
   useEffect(() => {
     if (!panRequest) return
@@ -558,26 +1037,19 @@ function MercatorMap({
   }, [panRequest])
 
   const layers = useMemo(() => {
-    const z = viewState.zoom
-    const showRawPoints = displayMode === 'points'
-
-    const hexes = new HexagonLayer<PhotoPoint>({
+    const hexes = new PolygonLayer<MetricHex>({
       id: 'photo-hex',
-      data: points,
-      getPosition: (d) => [d.lon, d.lat],
-      radius: hexRadiusMeters(z),
-      coverage: 0.92,
-      extruded: false,
-      // Cap extremes so Europe doesn't steal the whole color scale
-      upperPercentile: 97,
-      lowerPercentile: 0,
-      colorRange: DENSITY_COLORS,
-      opacity: 0.9,
+      data: metricHexes,
+      getPolygon: (d) => d.polygon,
+      getFillColor: (d) => d.color,
+      // Hexes are only a few pixels wide, so any outline would hide the fill.
+      stroked: false,
+      filled: true,
+      opacity: 0.92,
+      visible: showHexes,
       pickable: false,
-      gpuAggregation: true,
-      visible: !showRawPoints,
       updateTriggers: {
-        radius: z,
+        getFillColor: metricMode,
       },
     })
 
@@ -588,12 +1060,36 @@ function MercatorMap({
       getRadius: 0.85,
       radiusUnits: 'pixels',
       radiusMinPixels: 0.6,
-      radiusMaxPixels: 1.35,
+      // Slightly fatter once hex view hands off, so photos stay legible.
+      radiusMaxPixels: beyondHexDetail ? 2.8 : 1.35,
       getFillColor: (_d, { index }) => pointColors[index],
-      visible: showRawPoints,
+      visible: showPhotoPoints,
       pickable: false,
       updateTriggers: {
         getFillColor: pointColors,
+      },
+    })
+
+    const populationDots = new ScatterplotLayer<{
+      position: [number, number]
+      color: Rgba
+    }>({
+      id: 'population-dots',
+      data: populationPointPositions.map((position, index) => ({
+        position,
+        color: populationPointColors[index],
+      })),
+      getPosition: (d) => d.position,
+      getRadius: populationPointRadius,
+      radiusUnits: 'pixels',
+      radiusMinPixels: 1,
+      radiusMaxPixels: 8,
+      getFillColor: (d) => d.color,
+      visible: showPopulationPoints,
+      pickable: false,
+      updateTriggers: {
+        getRadius: populationPointRadius,
+        getFillColor: populationPointColors,
       },
     })
 
@@ -616,12 +1112,58 @@ function MercatorMap({
       pickable: true,
       autoHighlight: true,
       highlightColor: [255, 255, 255, 180],
+      visible: showHottestMarkers,
     })
 
-    return [hexes, dots, pins, ...buildFocusLayers(focus)]
-  }, [points, hotspots, pointColors, viewState.zoom, displayMode, focus])
+    // Amber diamonds via filled circles with a dark ring — distinct from the
+    // multicolored hottest-cluster pins.
+    const mostViewedPins = new ScatterplotLayer<PhotoPoint>({
+      id: 'most-viewed-pins',
+      data: mostViewed,
+      getPosition: (d) => [d.lon, d.lat],
+      getRadius: 6,
+      radiusUnits: 'pixels',
+      radiusMinPixels: 5,
+      radiusMaxPixels: 8,
+      getFillColor: [255, 210, 60, 255],
+      getLineColor: [20, 24, 28, 230],
+      lineWidthMinPixels: 1.75,
+      stroked: true,
+      filled: true,
+      pickable: true,
+      autoHighlight: true,
+      highlightColor: [255, 255, 255, 200],
+      visible: showMostViewedMarkers,
+    })
 
-  const onHover = useCallback((info: PickingInfo<Hotspot | MapFocus>) => {
+    return [
+      hexes,
+      dots,
+      populationDots,
+      pins,
+      mostViewedPins,
+      ...buildFocusLayers(focus),
+    ]
+  }, [
+    points,
+    hotspots,
+    mostViewed,
+    pointColors,
+    populationPointColors,
+    populationPointPositions,
+    populationPointRadius,
+    metricHexes,
+    metricMode,
+    beyondHexDetail,
+    showHexes,
+    showPhotoPoints,
+    showPopulationPoints,
+    showHottestMarkers,
+    showMostViewedMarkers,
+    focus,
+  ])
+
+  const onHover = useCallback((info: PickingInfo<Hotspot | PhotoPoint | MapFocus>) => {
     const layerId = info.layer?.id
     if (info.object && layerId === 'hotspot-pins') {
       const hotspot = info.object as Hotspot
@@ -629,6 +1171,14 @@ function MercatorMap({
         x: info.x,
         y: info.y,
         preview: focusFromHotspot(hotspot),
+      })
+      return
+    }
+    if (info.object && layerId === 'most-viewed-pins') {
+      setHover({
+        x: info.x,
+        y: info.y,
+        preview: focusFromPhoto(info.object as PhotoPoint),
       })
       return
     }
@@ -647,10 +1197,14 @@ function MercatorMap({
   }, [])
 
   const onClick = useCallback(
-    (info: PickingInfo<Hotspot | MapFocus>) => {
+    (info: PickingInfo<Hotspot | PhotoPoint | MapFocus>) => {
       const layerId = info.layer?.id
       if (info.object && layerId === 'hotspot-pins') {
         onSelectFocus?.(focusFromHotspot(info.object as Hotspot))
+        return
+      }
+      if (info.object && layerId === 'most-viewed-pins') {
+        onSelectFocus?.(focusFromPhoto(info.object as PhotoPoint))
         return
       }
       if (
@@ -687,7 +1241,12 @@ function MercatorMap({
 function EqualEarthMap({
   points,
   hotspots,
-  displayMode,
+  mostViewed,
+  populationRates,
+  viewMode,
+  metricMode,
+  showHottestMarkers,
+  showMostViewedMarkers,
   focus,
   panRequest,
   onSelectFocus,
@@ -696,6 +1255,21 @@ function EqualEarthMap({
     EQUAL_EARTH_INITIAL,
   )
   const [hover, setHover] = useState<HoverInfo>(null)
+  // Hexes only in hex view. Points view always shows points — World pop uses
+  // one projected dot per inhabited cell (also the hex deep-zoom handoff).
+  const beyondHexDetail = isBeyondHexDetail(
+    EQUAL_EARTH_UNITS_PER_DEGREE,
+    Number(viewState.zoom ?? 0),
+    populationRates?.cellDegrees ?? 0,
+  )
+  const showHexes = viewMode === 'hex' && !beyondHexDetail
+  const showPhotoPoints =
+    metricMode !== 'population' &&
+    (viewMode === 'points' || beyondHexDetail)
+  const showPopulationPoints =
+    metricMode === 'population' &&
+    !!populationRates &&
+    (viewMode === 'points' || beyondHexDetail)
 
   useEffect(() => {
     if (!panRequest) return
@@ -718,13 +1292,34 @@ function EqualEarthMap({
   }, [panRequest])
 
   const projectedPoints = useMemo<ProjectedPoint[]>(() => {
-    const colors = buildPointDensityColors(points)
+    const colors = buildPointMetricColors(points, populationRates, metricMode)
     return points.map((source, index) => ({
       source,
       position: project(source.lon, source.lat),
       color: colors[index],
     }))
-  }, [points])
+  }, [points, populationRates, metricMode])
+  const projectedPopulationDots = useMemo(() => {
+    if (!populationRates) return []
+    const colors = buildPopulationPointColors(populationRates)
+    const cellDeg = populationRates.cellDegrees
+    return populationRates.cells.map((cell, index) => {
+      const [lon, lat] = jitterCellCenter(cell.lat, cell.lon, cellDeg)
+      return {
+        position: project(lon, lat),
+        color: colors[index],
+      }
+    })
+  }, [populationRates])
+  const populationPointRadius = useMemo(
+    () =>
+      populationPointRadiusPx(
+        EQUAL_EARTH_UNITS_PER_DEGREE,
+        Number(viewState.zoom ?? 0),
+        populationRates?.cellDegrees ?? 0.25,
+      ),
+    [populationRates?.cellDegrees, viewState.zoom],
+  )
   const projectedHotspots = useMemo<ProjectedHotspot[]>(
     () =>
       hotspots.map((source) => ({
@@ -733,9 +1328,51 @@ function EqualEarthMap({
       })),
     [hotspots],
   )
-  const equalEarthBins = useMemo(
-    () => buildEqualEarthBins(projectedPoints),
-    [projectedPoints],
+  const projectedMostViewed = useMemo(
+    () =>
+      mostViewed.map((source) => ({
+        source,
+        position: project(source.lon, source.lat),
+      })),
+    [mostViewed],
+  )
+  const photoProjectedPositions = useMemo(
+    () => toFlatPositions(points, project),
+    [points],
+  )
+  const populationProjectedSamples = useMemo(
+    () => toFlatPopulationSamples(populationRates, project),
+    [populationRates],
+  )
+  const hexAggregates = useMemo(() => {
+    const zoomStep = Math.round(Number(viewState.zoom ?? 0) * 2) / 2
+    const radius = hexRadius(
+      EQUAL_EARTH_UNITS_PER_DEGREE,
+      zoomStep,
+      populationRates?.cellDegrees ?? 0,
+    )
+    return aggregateHexes(
+      radius,
+      photoProjectedPositions,
+      populationProjectedSamples,
+    )
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    photoProjectedPositions,
+    populationProjectedSamples,
+    populationRates?.cellDegrees,
+    Math.round(Number(viewState.zoom ?? 0) * 2) / 2,
+  ])
+  const metricHexes = useMemo(
+    () =>
+      buildMetricHexes(
+        hexAggregates,
+        metricMode,
+        populationRates?.populationFloor ?? 1_000,
+        // Already in Equal Earth space; hand the vertex through untouched.
+        (x, y) => [x, y],
+      ),
+    [hexAggregates, metricMode, populationRates?.populationFloor],
   )
 
   const layers = useMemo(() => {
@@ -752,19 +1389,20 @@ function EqualEarthMap({
       pickable: false,
     })
 
-    const hexes = new PolygonLayer<EqualEarthBin>({
+    const hexes = new PolygonLayer<MetricHex>({
       id: 'equal-earth-hex',
-      data: equalEarthBins,
+      data: metricHexes,
       coordinateSystem: COORDINATE_SYSTEM.CARTESIAN,
       getPolygon: (d) => d.polygon,
       getFillColor: (d) => d.color,
-      getLineColor: [10, 12, 14, 100],
-      lineWidthMinPixels: 0.25,
-      stroked: true,
+      stroked: false,
       filled: true,
-      opacity: 0.9,
-      visible: displayMode === 'hex',
+      opacity: 0.92,
+      visible: showHexes,
       pickable: false,
+      updateTriggers: {
+        getFillColor: metricMode,
+      },
     })
 
     const dots = new ScatterplotLayer<ProjectedPoint>({
@@ -775,10 +1413,33 @@ function EqualEarthMap({
       getRadius: 0.85,
       radiusUnits: 'pixels',
       radiusMinPixels: 0.6,
-      radiusMaxPixels: 1.35,
+      radiusMaxPixels: beyondHexDetail ? 2.8 : 1.35,
       getFillColor: (d) => d.color,
-      visible: displayMode === 'points',
+      visible: showPhotoPoints,
       pickable: false,
+      updateTriggers: {
+        getFillColor: metricMode,
+      },
+    })
+
+    const populationDots = new ScatterplotLayer<{
+      position: XY
+      color: Rgba
+    }>({
+      id: 'equal-earth-population-dots',
+      data: projectedPopulationDots,
+      coordinateSystem: COORDINATE_SYSTEM.CARTESIAN,
+      getPosition: (d) => d.position,
+      getRadius: populationPointRadius,
+      radiusUnits: 'pixels',
+      radiusMinPixels: 1,
+      radiusMaxPixels: 8,
+      getFillColor: (d) => d.color,
+      visible: showPopulationPoints,
+      pickable: false,
+      updateTriggers: {
+        getRadius: populationPointRadius,
+      },
     })
 
     const pins = new ScatterplotLayer<ProjectedHotspot>({
@@ -800,31 +1461,80 @@ function EqualEarthMap({
       filled: true,
       pickable: true,
       autoHighlight: true,
+      visible: showHottestMarkers,
+    })
+
+    const mostViewedPins = new ScatterplotLayer<{
+      source: PhotoPoint
+      position: XY
+    }>({
+      id: 'equal-earth-most-viewed',
+      data: projectedMostViewed,
+      coordinateSystem: COORDINATE_SYSTEM.CARTESIAN,
+      getPosition: (d) => d.position,
+      getRadius: 6,
+      radiusUnits: 'pixels',
+      radiusMinPixels: 5,
+      radiusMaxPixels: 8,
+      getFillColor: [255, 210, 60, 255],
+      getLineColor: [20, 24, 28, 230],
+      lineWidthMinPixels: 1.75,
+      stroked: true,
+      filled: true,
+      pickable: true,
+      autoHighlight: true,
+      highlightColor: [255, 255, 255, 200],
+      visible: showMostViewedMarkers,
     })
 
     return [
       land,
       hexes,
       dots,
+      populationDots,
       pins,
+      mostViewedPins,
       ...buildFocusLayers(focus, { cartesian: true }),
     ]
   }, [
-    displayMode,
-    equalEarthBins,
+    beyondHexDetail,
     focus,
+    metricHexes,
+    metricMode,
     projectedHotspots,
+    projectedMostViewed,
     projectedPoints,
+    projectedPopulationDots,
+    populationPointRadius,
+    showHexes,
+    showPhotoPoints,
+    showPopulationPoints,
+    showHottestMarkers,
+    showMostViewedMarkers,
   ])
 
   const onHover = useCallback(
-    (info: PickingInfo<ProjectedHotspot | MapFocus>) => {
+    (
+      info: PickingInfo<
+        ProjectedHotspot | { source: PhotoPoint; position: XY } | MapFocus
+      >,
+    ) => {
       const layerId = info.layer?.id
       if (info.object && layerId === 'equal-earth-pins') {
         setHover({
           x: info.x,
           y: info.y,
           preview: focusFromHotspot((info.object as ProjectedHotspot).source),
+        })
+        return
+      }
+      if (info.object && layerId === 'equal-earth-most-viewed') {
+        setHover({
+          x: info.x,
+          y: info.y,
+          preview: focusFromPhoto(
+            (info.object as { source: PhotoPoint }).source,
+          ),
         })
         return
       }
@@ -842,11 +1552,21 @@ function EqualEarthMap({
   )
 
   const onClick = useCallback(
-    (info: PickingInfo<ProjectedHotspot | MapFocus>) => {
+    (
+      info: PickingInfo<
+        ProjectedHotspot | { source: PhotoPoint; position: XY } | MapFocus
+      >,
+    ) => {
       const layerId = info.layer?.id
       if (info.object && layerId === 'equal-earth-pins') {
         onSelectFocus?.(
           focusFromHotspot((info.object as ProjectedHotspot).source),
+        )
+        return
+      }
+      if (info.object && layerId === 'equal-earth-most-viewed') {
+        onSelectFocus?.(
+          focusFromPhoto((info.object as { source: PhotoPoint }).source),
         )
         return
       }
@@ -949,6 +1669,7 @@ type ToggleGroupProps = {
   options: { value: string; label: string }[]
   value: string
   onChange: (value: string) => void
+  compact?: boolean
 }
 
 function ToggleGroup({
@@ -956,9 +1677,12 @@ function ToggleGroup({
   options,
   value,
   onChange,
+  compact = false,
 }: ToggleGroupProps) {
   return (
-    <fieldset className="toggle-group">
+    <fieldset
+      className={`toggle-group${compact ? ' toggle-group--compact' : ''}`}
+    >
       <legend>{label}</legend>
       <div>
         {options.map((option) => (
@@ -967,6 +1691,7 @@ function ToggleGroup({
             type="button"
             className={value === option.value ? 'is-active' : ''}
             aria-pressed={value === option.value}
+            title={`${label}: ${option.label}`}
             onClick={() => onChange(option.value)}
           >
             {option.label}
@@ -993,10 +1718,14 @@ async function downloadHighResMap(
   hotspots: Hotspot[],
   mostViewed: PhotoPoint[],
   options: {
-    displayMode: DisplayMode
+    viewMode: ViewMode
+    metricMode: MetricMode
     projectionMode: ProjectionMode
     downloadedAt?: string
     selectedFocus?: MapFocus | null
+    populationRates?: PopulationRateDataset | null
+    showHottestMarkers?: boolean
+    showMostViewedMarkers?: boolean
   },
 ): Promise<void> {
   const width = 7680
@@ -1044,13 +1773,34 @@ async function downloadHighResMap(
   context.lineWidth = 1.5
   context.stroke()
 
-  if (options.displayMode === 'points') {
-    drawExportPoints(context, points, projection)
+  // Hex view shares one tessellation across metrics. Points view always draws
+  // points — World pop uses one dot per inhabited 0.25° cell.
+  if (options.viewMode === 'hex') {
+    drawExportHexes(
+      context,
+      points,
+      projection,
+      options.metricMode,
+      options.populationRates ?? null,
+    )
+  } else if (
+    options.metricMode === 'population' &&
+    options.populationRates
+  ) {
+    drawExportPopulationPoints(context, options.populationRates, projection)
   } else {
-    drawExportHexes(context, points, projection)
+    drawExportPoints(context, points, projection, {
+      metricMode: options.metricMode,
+      populationRates: options.populationRates,
+    })
   }
 
-  drawExportHotspots(context, hotspots, projection)
+  if (options.showHottestMarkers !== false) {
+    drawExportHotspots(context, hotspots, projection)
+  }
+  if (options.showMostViewedMarkers !== false) {
+    drawExportMostViewed(context, mostViewed, projection)
+  }
   if (options.selectedFocus) {
     drawExportFocusMarker(context, options.selectedFocus, projection)
   }
@@ -1074,7 +1824,14 @@ async function downloadHighResMap(
     260,
     268,
   )
-  drawExportDensityLegend(context, 260, 300)
+  const legend = metricLegendLabels(options.metricMode)
+  drawExportDensityLegend(
+    context,
+    260,
+    300,
+    `Low ${legend.title.toLowerCase()}`,
+    `High ${legend.title.toLowerCase()}`,
+  )
 
   drawExportControls(context, width, options)
   await drawExportPanels(context, width, height, hotspots, mostViewed)
@@ -1082,12 +1839,12 @@ async function downloadHighResMap(
     await drawExportPhotoPeek(context, height, options.selectedFocus)
   }
 
-  context.textAlign = 'right'
+  context.textAlign = 'left'
   context.fillStyle = '#75818a'
   context.font = '400 22px Arial, sans-serif'
   context.fillText(
-    'Built by kobakhit · Source: Flickr · boundaries: Natural Earth · rendered at 7680 × 4320',
-    width - 220,
+    'Built by kobakhit · Flickr · GHSL GHS-POP R2023A · Natural Earth · 7680 × 4320',
+    220,
     height - 90,
   )
   context.textAlign = 'start'
@@ -1101,7 +1858,7 @@ async function downloadHighResMap(
   const url = URL.createObjectURL(blob)
   const link = document.createElement('a')
   link.href = url
-  link.download = `flickr-2026-${options.displayMode}-${options.projectionMode}-8k.png`
+  link.download = `flickr-2026-${options.viewMode}-${options.metricMode}-${options.projectionMode}-8k.png`
   link.click()
   window.setTimeout(() => URL.revokeObjectURL(url), 30_000)
 }
@@ -1145,8 +1902,16 @@ function drawExportPoints(
   context: CanvasRenderingContext2D,
   points: PhotoPoint[],
   projection: GeoProjection,
+  options?: {
+    metricMode?: MetricMode
+    populationRates?: PopulationRateDataset | null
+  },
 ) {
-  const colors = buildPointDensityColors(points)
+  const colors = buildPointMetricColors(
+    points,
+    options?.populationRates ?? null,
+    options?.metricMode ?? 'photos',
+  )
   const pointSize = 3.6
   const half = pointSize / 2
   // Batch by color so we don't set fillStyle ~300k times.
@@ -1172,78 +1937,105 @@ function drawExportPoints(
   context.restore()
 }
 
+function drawExportPopulationPoints(
+  context: CanvasRenderingContext2D,
+  dataset: PopulationRateDataset,
+  projection: GeoProjection,
+) {
+  const colors = buildPopulationPointColors(dataset)
+  const origin = projection([0, 0])
+  const eastward = projection([dataset.cellDegrees, 0])
+  const northward = projection([0, dataset.cellDegrees])
+  const spacingX =
+    origin && eastward ? Math.abs(eastward[0] - origin[0]) : 5
+  const spacingY =
+    origin && northward ? Math.abs(northward[1] - origin[1]) : spacingX
+  // Cover the cell so Equal Earth latitude rows don't leave dark scanlines.
+  const pointSize = Math.max(4.5, Math.min(spacingX, spacingY) * 1.15)
+  const half = pointSize / 2
+  const buckets = new Map<string, XY[]>()
+  for (let i = 0; i < dataset.cells.length; i += 1) {
+    const cell = dataset.cells[i]
+    const [lon, lat] = jitterCellCenter(
+      cell.lat,
+      cell.lon,
+      dataset.cellDegrees,
+    )
+    const xy = projection([lon, lat])
+    if (!xy) continue
+    const [r, g, b, a] = colors[i]
+    const key = `${r},${g},${b},${a}`
+    const bucket = buckets.get(key)
+    if (bucket) bucket.push(xy)
+    else buckets.set(key, [xy])
+  }
+
+  context.save()
+  for (const [key, coords] of buckets) {
+    const [r, g, b, a] = key.split(',').map(Number)
+    context.fillStyle = `rgba(${r},${g},${b},${(a / 255).toFixed(3)})`
+    for (const xy of coords) {
+      context.beginPath()
+      context.arc(xy[0], xy[1], half, 0, Math.PI * 2)
+      context.fill()
+    }
+  }
+  context.restore()
+}
+
+/** Hex size for exports, chosen to match the default world view on screen. */
+const EXPORT_HEX_DEGREES = 0.8
+
 function drawExportHexes(
   context: CanvasRenderingContext2D,
   points: PhotoPoint[],
   projection: GeoProjection,
+  metric: MetricMode,
+  dataset: PopulationRateDataset | null,
 ) {
-  type Bin = { q: number; r: number; count: number }
-  const radius = 10
-  const sqrt3 = Math.sqrt(3)
-  const bins = new Map<string, Bin>()
+  const toSpace = (lon: number, lat: number): XY =>
+    (projection([lon, lat]) as XY | null) ?? [NaN, NaN]
+  const origin = projection([0, 0])
+  const eastward = projection([1, 0])
+  const pixelsPerDegree =
+    origin && eastward ? Math.abs(eastward[0] - origin[0]) : 21
+  const radius =
+    Math.max(EXPORT_HEX_DEGREES, dataset?.cellDegrees ?? 0) * pixelsPerDegree
 
-  for (const point of points) {
-    const xy = projection([point.lon, point.lat])
-    if (!xy) continue
-    const q = (sqrt3 / 3 * xy[0] - xy[1] / 3) / radius
-    const r = (2 / 3 * xy[1]) / radius
-    const cubeX = q
-    const cubeZ = r
-    const cubeY = -cubeX - cubeZ
-    let rx = Math.round(cubeX)
-    let ry = Math.round(cubeY)
-    let rz = Math.round(cubeZ)
-    const dx = Math.abs(rx - cubeX)
-    const dy = Math.abs(ry - cubeY)
-    const dz = Math.abs(rz - cubeZ)
-    if (dx > dy && dx > dz) rx = -ry - rz
-    else if (dy > dz) ry = -rx - rz
-    else rz = -rx - ry
-    const key = `${rx},${rz}`
-    const bin = bins.get(key)
-    if (bin) bin.count += 1
-    else bins.set(key, { q: rx, r: rz, count: 1 })
-  }
-
-  const sortedCounts = [...bins.values()]
-    .map((bin) => bin.count)
-    .sort((a, b) => a - b)
-  const cap = sortedCounts[Math.floor(sortedCounts.length * 0.97)] ?? 1
-  const grouped: XY[][] = Array.from(
-    { length: DENSITY_COLORS.length },
-    () => [],
+  const hexes = buildMetricHexes(
+    aggregateHexes(
+      radius,
+      toFlatPositions(points, toSpace),
+      toFlatPopulationSamples(dataset, toSpace),
+    ),
+    metric,
+    dataset?.populationFloor ?? 1_000,
+    (x, y) => [x, y],
   )
 
-  for (const bin of bins.values()) {
-    const normalized =
-      Math.log1p(Math.min(bin.count, cap)) / Math.log1p(cap)
-    const index = Math.min(
-      DENSITY_COLORS.length - 1,
-      Math.floor(normalized * DENSITY_COLORS.length),
-    )
-    grouped[index].push([
-      radius * sqrt3 * (bin.q + bin.r / 2),
-      radius * 1.5 * bin.r,
-    ])
+  // Batch by color so the 8K canvas isn't restyled per hex.
+  const grouped = new Map<string, [number, number][][]>()
+  for (const hex of hexes) {
+    const [r, g, b] = hex.color
+    const key = `${r},${g},${b}`
+    const bucket = grouped.get(key)
+    if (bucket) bucket.push(hex.polygon)
+    else grouped.set(key, [hex.polygon])
   }
 
   context.save()
-  grouped.forEach((centers, colorIndex) => {
-    const [red, green, blue] = DENSITY_COLORS[colorIndex]
+  for (const [key, polygons] of grouped) {
     context.beginPath()
-    for (const [cx, cy] of centers) {
-      for (let i = 0; i < 6; i++) {
-        const angle = ((60 * i - 30) * Math.PI) / 180
-        const x = cx + radius * 0.9 * Math.cos(angle)
-        const y = cy + radius * 0.9 * Math.sin(angle)
+    for (const polygon of polygons) {
+      polygon.forEach(([x, y], i) => {
         if (i === 0) context.moveTo(x, y)
         else context.lineTo(x, y)
-      }
+      })
       context.closePath()
     }
-    context.fillStyle = `rgba(${red}, ${green}, ${blue}, 0.92)`
+    context.fillStyle = `rgba(${key}, 0.92)`
     context.fill()
-  })
+  }
   context.restore()
 }
 
@@ -1364,10 +2156,40 @@ function drawExportHotspots(
   }
 }
 
+function drawExportMostViewed(
+  context: CanvasRenderingContext2D,
+  photos: PhotoPoint[],
+  projection: GeoProjection,
+) {
+  context.font = '500 28px Arial, sans-serif'
+  context.textBaseline = 'middle'
+  for (const photo of photos) {
+    const xy = projection([photo.lon, photo.lat])
+    if (!xy) continue
+    const [x, y] = xy
+    context.beginPath()
+    context.arc(x, y, 9, 0, Math.PI * 2)
+    context.fillStyle = '#ffd23c'
+    context.fill()
+    context.strokeStyle = '#14181c'
+    context.lineWidth = 2.5
+    context.stroke()
+
+    const label = (photo.title || 'Untitled').slice(0, 28)
+    context.lineWidth = 7
+    context.strokeStyle = 'rgba(8, 11, 14, 0.9)'
+    context.strokeText(label, x + 16, y)
+    context.fillStyle = '#ffd23c'
+    context.fillText(label, x + 16, y)
+  }
+}
+
 function drawExportDensityLegend(
   context: CanvasRenderingContext2D,
   x: number,
   y: number,
+  lowLabel = 'Low density',
+  highLabel = 'High density',
 ) {
   const rampWidth = 520
   const rampHeight = 22
@@ -1386,9 +2208,9 @@ function drawExportDensityLegend(
 
   context.fillStyle = '#8b969e'
   context.font = '500 22px Arial, sans-serif'
-  context.fillText('Low density', x, y + 52)
+  context.fillText(lowLabel, x, y + 52)
   context.textAlign = 'right'
-  context.fillText('High density', x + rampWidth, y + 52)
+  context.fillText(highLabel, x + rampWidth, y + 52)
   context.textAlign = 'start'
 }
 
@@ -1396,14 +2218,17 @@ function drawExportControls(
   context: CanvasRenderingContext2D,
   width: number,
   options: {
-    displayMode: DisplayMode
+    viewMode: ViewMode
+    metricMode: MetricMode
     projectionMode: ProjectionMode
+    showHottestMarkers?: boolean
+    showMostViewedMarkers?: boolean
   },
 ) {
-  const x = width - 1860
+  const x = width - 2100
   const y = 90
-  const panelWidth = 1600
-  const panelHeight = 165
+  const panelWidth = 1840
+  const panelHeight = 250
   drawPanel(context, x, y, panelWidth, panelHeight)
 
   drawExportToggle(
@@ -1412,26 +2237,59 @@ function drawExportControls(
     y + 38,
     'VIEW',
     ['Hex density', 'Points'],
-    options.displayMode === 'hex' ? 0 : 1,
+    options.viewMode === 'hex' ? 0 : 1,
+    175,
   )
   drawExportToggle(
     context,
-    x + 650,
+    x + 420,
+    y + 38,
+    'METRIC',
+    ['Photo count', 'World pop', 'Per capita'],
+    options.metricMode === 'photos'
+      ? 0
+      : options.metricMode === 'population'
+        ? 1
+        : 2,
+    155,
+  )
+  drawExportToggle(
+    context,
+    x + 910,
     y + 38,
     'PROJECTION',
     ['Mercator', 'Equal Earth'],
     options.projectionMode === 'mercator' ? 0 : 1,
+    165,
+  )
+  drawExportToggle(
+    context,
+    x + 1265,
+    y + 38,
+    'HOTTEST',
+    ['Show', 'Hide'],
+    options.showHottestMarkers === false ? 1 : 0,
+    120,
+  )
+  drawExportToggle(
+    context,
+    x + 1525,
+    y + 38,
+    'MOST VIEWED',
+    ['Show', 'Hide'],
+    options.showMostViewedMarkers === false ? 1 : 0,
+    120,
   )
 
   context.fillStyle = 'rgba(255, 210, 60, 0.12)'
   context.strokeStyle = 'rgba(255, 210, 60, 0.6)'
   context.lineWidth = 2
-  context.fillRect(x + 1280, y + 66, 265, 65)
-  context.strokeRect(x + 1280, y + 66, 265, 65)
+  context.fillRect(x + 1520, y + 148, 265, 65)
+  context.strokeRect(x + 1520, y + 148, 265, 65)
   context.fillStyle = '#ffd23c'
   context.font = '600 27px Arial, sans-serif'
   context.textAlign = 'center'
-  context.fillText('Export 8K', x + 1412, y + 108)
+  context.fillText('Export 8K', x + 1652, y + 190)
   context.textAlign = 'start'
 }
 
@@ -1440,14 +2298,14 @@ function drawExportToggle(
   x: number,
   y: number,
   label: string,
-  options: [string, string],
+  options: string[],
   selected: number,
+  buttonWidth = 245,
 ) {
   context.fillStyle = '#8b969e'
   context.font = '500 19px Arial, sans-serif'
   context.fillText(label, x, y)
   const buttonY = y + 22
-  const buttonWidth = 245
   options.forEach((option, index) => {
     context.fillStyle =
       index === selected ? '#ffd23c' : 'rgba(255,255,255,0.035)'
@@ -1456,7 +2314,7 @@ function drawExportToggle(
     context.lineWidth = 2
     context.strokeRect(x + index * buttonWidth, buttonY, buttonWidth, 65)
     context.fillStyle = index === selected ? '#161616' : '#9ba6ad'
-    context.font = '500 25px Arial, sans-serif'
+    context.font = '500 22px Arial, sans-serif'
     context.textAlign = 'center'
     context.fillText(
       option,

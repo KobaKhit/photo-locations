@@ -10,15 +10,19 @@ import {
   findHotspots,
   findMostViewed,
   loadDataset,
+  loadPopulationRates,
   resolvePlaceNames,
   type Hotspot,
   type PhotoPoint,
+  type PopulationRateDataset,
 } from './flickr'
 import './App.css'
 
 export default function App() {
   const [points, setPoints] = useState<PhotoPoint[]>([])
   const [hotspots, setHotspots] = useState<Hotspot[]>([])
+  const [populationRates, setPopulationRates] =
+    useState<PopulationRateDataset | null>(null)
   const [meta, setMeta] = useState<{
     count: number
     estimatedTotal: number | null
@@ -44,6 +48,14 @@ export default function App() {
           estimatedTotal: data.estimatedTotal,
           downloadedAt: data.downloadedAt,
         })
+        // This optional precomputed layer should never block the core map.
+        loadPopulationRates()
+          .then((rates) => {
+            if (!cancelled) setPopulationRates(rates)
+          })
+          .catch((rateError) => {
+            console.warn('Population-normalized grid unavailable', rateError)
+          })
 
         const rawHotspots = findHotspots(data.points, 12)
         setHotspots(rawHotspots)
@@ -108,6 +120,7 @@ export default function App() {
         points={points}
         hotspots={hotspots}
         mostViewed={mostViewed}
+        populationRates={populationRates}
         downloadedAt={meta?.downloadedAt}
         focus={focus}
         selectedFocus={selectedFocus}

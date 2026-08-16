@@ -26,6 +26,23 @@ export type PhotoDataset = {
   points: PhotoPoint[]
 }
 
+export type PopulationRateCell = {
+  lat: number
+  lon: number
+  photos: number
+  population: number
+  photosPerThousand: number
+}
+
+export type PopulationRateDataset = {
+  source: string
+  sourceUrl: string
+  populationYear: number
+  cellDegrees: number
+  populationFloor: number
+  cells: PopulationRateCell[]
+}
+
 const PIN_COLORS = [
   // Okabe–Ito (colorblind-safe categorical markers)
   '#E69F00',
@@ -43,6 +60,10 @@ const DATA_URL = `${import.meta.env.BASE_URL}data/photos-2026.json`.replace(
   /([^:]\/)\/+/g,
   '$1',
 )
+const POPULATION_RATE_URL = `${import.meta.env.BASE_URL}data/photo-rates-per-capita-2026.json`.replace(
+  /([^:]\/)\/+/g,
+  '$1',
+)
 
 /** Load previously downloaded Flickr points from disk (served via /public). */
 export async function loadDataset(): Promise<PhotoDataset> {
@@ -54,6 +75,15 @@ export async function loadDataset(): Promise<PhotoDataset> {
   }
   if (!res.ok) throw new Error(`Failed to load dataset (HTTP ${res.status})`)
   return (await res.json()) as PhotoDataset
+}
+
+/** Load the offline-prepared population / photo-rate grid (GHSL 2020). */
+export async function loadPopulationRates(): Promise<PopulationRateDataset> {
+  const res = await fetch(POPULATION_RATE_URL)
+  if (!res.ok) {
+    throw new Error(`Failed to load population rate grid (HTTP ${res.status})`)
+  }
+  return (await res.json()) as PopulationRateDataset
 }
 
 /** Grid-cluster points; return the densest cells as pin hotspots, spread globally. */
