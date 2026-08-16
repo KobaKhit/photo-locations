@@ -1,6 +1,11 @@
 import { readFile, writeFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { fromUrl } from 'geotiff'
+import {
+  CAPITA_MIN_PHOTOS,
+  ebPhotosPerThousand,
+  estimateEbParams,
+} from './lib/empirical-bayes.mjs'
 
 const root = resolve(import.meta.dirname, '..')
 const photosPath = resolve(root, 'public/data/photos-2026.json')
@@ -70,27 +75,34 @@ console.log(
   `Inhabited population cells: ${populations.size.toLocaleString()}. Writing…`,
 )
 
-const cells = [...populations.entries()]
-  .map(([key, rawPopulation]) => {
-    const photos = photoCounts.get(key) ?? 0
-    const population = Math.round(rawPopulation)
-    const { lat, lon } = gridCellFromKey(key)
-    return {
-      lat: Number(lat.toFixed(3)),
-      lon: Number(lon.toFixed(3)),
-      photos,
-      population,
-      photosPerThousand:
-        photos > 0
-          ? Number(
-              (
-                (photos * 1_000) /
-                Math.max(population, POPULATION_FLOOR)
-              ).toFixed(4),
-            )
-          : 0,
-    }
-  })
+const baseCells = [...populations.entries()].map(([key, rawPopulation]) => {
+  const photos = photoCounts.get(key) ?? 0
+  const population = Math.round(rawPopulation)
+  const { lat, lon } = gridCellFromKey(key)
+  return {
+    lat: Number(lat.toFixed(3)),
+    lon: Number(lon.toFixed(3)),
+    photos,
+    population,
+  }
+})
+
+const eb = estimateEbParams(baseCells, POPULATION_FLOOR)
+const cells = baseCells
+  .map((cell) => ({
+    ...cell,
+    photosPerThousand:
+      cell.photos >= CAPITA_MIN_PHOTOS
+        ? Number(
+            ebPhotosPerThousand(
+              cell.photos,
+              cell.population,
+              eb,
+              POPULATION_FLOOR,
+            ).toFixed(4),
+          )
+        : 0,
+  }))
   .filter((cell) => cell.population > 0)
 
 const output = {
@@ -100,13 +112,25 @@ const output = {
   populationYear: 2020,
   cellDegrees: CELL_DEGREES,
   populationFloor: POPULATION_FLOOR,
+  ebMean: eb.mean,
+  ebStrength: eb.strength,
+  minPhotos: CAPITA_MIN_PHOTOS,
+  rateMethod: 'empirical-bayes-gamma-poisson',
   photosDatasetDownloadedAt: dataset.downloadedAt,
   cells,
 }
 
 await writeFile(outputPath, JSON.stringify(output))
 const withPhotos = cells.filter((cell) => cell.photos > 0).length
+const withCapita = cells.filter(
+  (cell) => cell.photos >= CAPITA_MIN_PHOTOS,
+).length
 console.log(
   `Wrote ${cells.length.toLocaleString()} inhabited cells ` +
-    `(${withPhotos.toLocaleString()} with photos) to ${outputPath}`,
+    `(${withPhotos.toLocaleString()} with photos, ` +
+    `${withCapita.toLocaleString()} Capita-eligible) to ${outputPath}`,
+)
+console.log(
+  `EB params: μ=${eb.mean.toExponential(3)} photos/resident, ` +
+    `C=${eb.strength.toFixed(1)} residents`,
 )

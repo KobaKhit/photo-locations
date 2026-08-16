@@ -16,6 +16,29 @@ npm run download
 
 Writes `public/data/photos-2026.json` (tracked with Git LFS). Safe to re-run — finished tiles are skipped.
 
+Incremental update (new photos since last crawl, early-stop per tile):
+
+```bash
+npm run download:update
+npm run prepare-owners
+```
+
+Optional cleanup / Capita refresh (no Flickr re-crawl):
+
+```bash
+npm run strip-null-island   # drop near-(0,0) placeholder geotags
+npm run recompute-capita    # EB-shrunk photos-per-resident rates
+npm run prepare-owners      # home country + local/tourist + Flickr share
+```
+
+Full refresh (re-crawl all tiles through today):
+
+```bash
+npm run download:refresh
+npm run prepare-owners
+npm run recompute-capita
+```
+
 Clone with LFS:
 
 ```bash

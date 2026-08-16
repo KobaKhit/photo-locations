@@ -5,6 +5,11 @@
 import { readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import {
+  CAPITA_MIN_PHOTOS,
+  ebPhotosPerThousand,
+  estimateEbParams,
+} from './lib/empirical-bayes.mjs'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 const photos = JSON.parse(
@@ -18,6 +23,11 @@ const CELL_DEG = 1.5
 const LIMIT = 12
 const MIN_SEP = 12
 const FLOOR = rates.populationFloor ?? 1_000
+const MIN_PHOTOS = rates.minPhotos ?? CAPITA_MIN_PHOTOS
+const EB =
+  rates.ebMean !== undefined && rates.ebStrength !== undefined
+    ? { mean: rates.ebMean, strength: rates.ebStrength }
+    : estimateEbParams(rates.cells, FLOOR)
 const OUT = join(root, 'public/data/hotspot-places-2026.json')
 
 function keyFor(lat, lon) {
@@ -89,13 +99,12 @@ function findPerCapitaHotspotsRanked() {
   }
   return pickSpread(
     [...cells.values()]
-      .filter((cell) => cell.count > 0)
+      .filter((cell) => cell.count >= MIN_PHOTOS)
       .map((cell) => ({
         lat: cell.latSum / cell.count,
         lon: cell.lonSum / cell.count,
         count: cell.count,
-        rate:
-          (cell.count * 1_000) / Math.max(cell.population, FLOOR),
+        rate: ebPhotosPerThousand(cell.count, cell.population, EB, FLOOR),
       }))
       .sort((a, b) => b.rate - a.rate),
   )

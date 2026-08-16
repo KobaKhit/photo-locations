@@ -1,14 +1,17 @@
 import { useEffect, useMemo, useState } from 'react'
+import { AboutPage } from './About'
 import {
   MapView,
   focusFromHotspot,
   focusFromPhoto,
+  type AudienceMode,
   type MapFocus,
   type MapPanRequest,
 } from './MapView'
 import {
   applyPlaceLabels,
   findPerCapitaHotspots,
+  findFlickrShareHotspots,
   findHotspots,
   findMostViewed,
   loadDataset,
@@ -16,24 +19,42 @@ import {
   loadPopulationRates,
   resolvePlaceNames,
   type Hotspot,
+  type HotspotPlaceLabels,
   type PhotoPoint,
   type PopulationRateDataset,
 } from './flickr'
 import './App.css'
 
+type Route = 'map' | 'about'
+
+function routeFromHash(): Route {
+  const raw = window.location.hash.replace(/^#\/?/, '').toLowerCase()
+  return raw === 'about' || raw.startsWith('about/') ? 'about' : 'map'
+}
+
 export default function App() {
+  const [route, setRoute] = useState<Route>(() => routeFromHash())
   const [points, setPoints] = useState<PhotoPoint[]>([])
   const [hotspots, setHotspots] = useState<Hotspot[]>([])
   const [perCapitaHotspots, setPerCapitaHotspots] = useState<Hotspot[]>([])
   const [metricMode, setMetricMode] = useState<
-    'photos' | 'population' | 'per-capita'
+    'photos' | 'population' | 'per-capita' | 'flickr-share'
   >('photos')
+  const [audienceMode, setAudienceMode] = useState<AudienceMode>('all')
   const [populationRates, setPopulationRates] =
     useState<PopulationRateDataset | null>(null)
+  const [placeLabels, setPlaceLabels] = useState<HotspotPlaceLabels>({})
+  const [flickrShareHotspots, setFlickrShareHotspots] = useState<Hotspot[]>([])
+  const [audienceHotspots, setAudienceHotspots] = useState<Hotspot[]>([])
   const [meta, setMeta] = useState<{
     count: number
     estimatedTotal: number | null
     downloadedAt?: string
+    roleCounts?: {
+      local: number
+      tourist: number
+      unknown: number
+    }
   } | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
@@ -42,6 +63,20 @@ export default function App() {
   const [panRequest, setPanRequest] = useState<MapPanRequest | null>(null)
   const [showHottestMarkers, setShowHottestMarkers] = useState(true)
   const [showMostViewedMarkers, setShowMostViewedMarkers] = useState(true)
+
+  useEffect(() => {
+    const onHashChange = () => setRoute(routeFromHash())
+    window.addEventListener('hashchange', onHashChange)
+    return () => window.removeEventListener('hashchange', onHashChange)
+  }, [])
+
+  useEffect(() => {
+    document.title =
+      route === 'about'
+        ? 'About · Most Photographed Places 2026'
+        : 'Most Photographed Places · 2026'
+    document.documentElement.dataset.page = route
+  }, [route])
 
   useEffect(() => {
     let cancelled = false
@@ -56,9 +91,11 @@ export default function App() {
           count: data.count,
           estimatedTotal: data.estimatedTotal,
           downloadedAt: data.downloadedAt,
+          roleCounts: data.roleCounts,
         })
 
         const placeLabels = await loadHotspotPlaceLabels().catch(() => ({}))
+        if (!cancelled) setPlaceLabels(placeLabels)
 
         // This optional precomputed layer should never block the core map.
         loadPopulationRates()
@@ -75,6 +112,18 @@ export default function App() {
                 setPerCapitaHotspots(applyPlaceLabels(named, placeLabels))
               }
             })
+            if (rates.flickrUsersByCountry) {
+              const rawFlickr = applyPlaceLabels(
+                findFlickrShareHotspots(data.points, rates, 12),
+                placeLabels,
+              )
+              setFlickrShareHotspots(rawFlickr)
+              resolvePlaceNames(rawFlickr).then((named) => {
+                if (!cancelled) {
+                  setFlickrShareHotspots(applyPlaceLabels(named, placeLabels))
+                }
+              })
+            }
           })
           .catch((rateError) => {
             console.warn('Population-normalized grid unavailable', rateError)
@@ -99,10 +148,70 @@ export default function App() {
   }, [])
 
   const mostViewed = useMemo(() => findMostViewed(points, 7), [points])
+  const hasAudienceRoles = useMemo(
+    () => points.some((point) => point.role !== undefined),
+    [points],
+  )
+  const mapPoints = useMemo(() => {
+    if (!hasAudienceRoles || audienceMode === 'all') return points
+    return points.filter((point) => point.role === audienceMode)
+  }, [points, audienceMode, hasAudienceRoles])
+
+  useEffect(() => {
+    if (!hasAudienceRoles || audienceMode === 'all') {
+      setAudienceHotspots([])
+      return
+    }
+    let cancelled = false
+    const raw = applyPlaceLabels(findHotspots(mapPoints, 12), placeLabels)
+    setAudienceHotspots(raw)
+    resolvePlaceNames(raw).then((named) => {
+      if (!cancelled) setAudienceHotspots(applyPlaceLabels(named, placeLabels))
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [mapPoints, audienceMode, hasAudienceRoles, placeLabels])
+
+  useEffect(() => {
+    if (!populationRates?.flickrUsersByCountry) return
+    let cancelled = false
+    const raw = applyPlaceLabels(
+      findFlickrShareHotspots(mapPoints, populationRates, 12),
+      placeLabels,
+    )
+    setFlickrShareHotspots(raw)
+    resolvePlaceNames(raw).then((named) => {
+      if (!cancelled) {
+        setFlickrShareHotspots(applyPlaceLabels(named, placeLabels))
+      }
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [mapPoints, populationRates, placeLabels])
+
   const visibleHotspots =
-    metricMode === 'per-capita' ? perCapitaHotspots : hotspots
+    metricMode === 'per-capita'
+      ? perCapitaHotspots
+      : metricMode === 'flickr-share'
+        ? flickrShareHotspots
+        : audienceMode !== 'all' && hasAudienceRoles
+          ? audienceHotspots
+          : hotspots
+
   const hotspotTitle =
-    metricMode === 'per-capita' ? 'Highest per capita' : 'Hottest clusters'
+    metricMode === 'per-capita'
+      ? 'Highest per resident (stabilized)'
+      : metricMode === 'flickr-share'
+        ? 'Highest per Flickr user'
+        : audienceMode === 'tourist'
+          ? 'Hottest tourist clusters'
+          : audienceMode === 'local'
+            ? 'Hottest local clusters'
+            : audienceMode === 'unknown'
+              ? 'Clusters with unknown photographer status'
+            : 'Hottest clusters'
 
   const asOfLabel = useMemo(() => {
     if (!meta?.downloadedAt) return null
@@ -144,10 +253,28 @@ export default function App() {
     else setHoverFocus(next)
   }
 
+  if (route === 'about') {
+    return (
+      <div className="app app--about">
+        <nav className="about-nav">
+          <a className="about-nav__back" href="#/">
+            ← Map
+          </a>
+          <span className="about-nav__current">About</span>
+        </nav>
+        <AboutPage
+          photoCount={points.length || meta?.count}
+          asOfLabel={asOfLabel}
+          roleCounts={meta?.roleCounts ?? null}
+        />
+      </div>
+    )
+  }
+
   return (
     <div className="app">
       <MapView
-        points={points}
+        points={mapPoints}
         hotspots={visibleHotspots}
         mostViewed={mostViewed}
         populationRates={populationRates}
@@ -157,6 +284,9 @@ export default function App() {
         panRequest={panRequest}
         onSelectFocus={selectFocus}
         onMetricModeChange={setMetricMode}
+        audienceMode={audienceMode}
+        onAudienceModeChange={setAudienceMode}
+        hasAudienceRoles={hasAudienceRoles}
         showHottestMarkers={showHottestMarkers}
         showMostViewedMarkers={showMostViewedMarkers}
         onShowHottestMarkersChange={setShowHottestMarkers}
@@ -164,7 +294,12 @@ export default function App() {
       />
 
       <header className="hud">
-        <h1 className="hud__title">Most photographed places 2026</h1>
+        <div className="hud__row">
+          <h1 className="hud__title">Most photographed places 2026</h1>
+          <a className="hud__about" href="#/about">
+            About
+          </a>
+        </div>
         <p className="hud__sub">
           Source: Flickr
           {points.length > 0
@@ -217,10 +352,21 @@ export default function App() {
                         <span className="legend__name" title={h.placeName}>
                           {h.placeName}
                         </span>
-                        <span className="legend__count">
+                        <span
+                          className="legend__count"
+                          title={
+                            h.photographers !== undefined
+                              ? `${h.count.toLocaleString()} photos · ${h.photographers.toLocaleString()} photographers`
+                              : undefined
+                          }
+                        >
                           {h.photosPerThousand === undefined
-                            ? h.count.toLocaleString()
-                            : `${h.photosPerThousand.toFixed(1)}/1k`}
+                            ? h.photographers !== undefined
+                              ? `${h.count.toLocaleString()} · ${h.photographers.toLocaleString()}p`
+                              : h.count.toLocaleString()
+                            : metricMode === 'flickr-share'
+                              ? `${h.photosPerThousand.toFixed(2)}/user`
+                              : `${h.photosPerThousand.toFixed(1)}/1k`}
                         </span>
                       </button>
                     </li>

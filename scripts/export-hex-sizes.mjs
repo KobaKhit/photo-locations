@@ -89,7 +89,7 @@ await page.getByRole('button', { name: 'Hex', exact: true }).click()
 await page.getByRole('button', { name: 'Photos', exact: true }).click()
 await page.getByRole('button', { name: 'Equal Earth', exact: true }).click()
 
-for (const label of ['Hottest', 'Per capita', 'Most viewed']) {
+for (const label of ['Hottest', 'Per resident', 'Most viewed']) {
   const chip = page.getByRole('button', { name: label, exact: true })
   if (
     (await chip.count()) > 0 &&

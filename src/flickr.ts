@@ -1,3 +1,10 @@
+import {
+  CAPITA_MIN_PHOTOS,
+  ebPhotosPerThousand,
+  estimateEbParams,
+  type EbParams,
+} from './rates'
+
 export type PhotoPoint = {
   id: string
   lat: number
@@ -6,12 +13,22 @@ export type PhotoPoint = {
   views: number
   url?: string
   taken?: string
+  /** Flickr NSID when present. */
+  owner?: string
+  /** Photo location country (Natural Earth name). */
+  country?: string | null
+  /** Inferred owner home country. */
+  home?: string
+  /** local = photo country matches home; tourist otherwise. */
+  role?: 'local' | 'tourist' | 'unknown'
 }
 
 export type Hotspot = {
   lat: number
   lon: number
   count: number
+  /** Distinct Flickr owners in the cluster (when available). */
+  photographers?: number
   /** Present for population-normalized hotspot rankings. */
   photosPerThousand?: number
   sample: PhotoPoint
@@ -26,6 +43,14 @@ export type PhotoDataset = {
   estimatedTotal: number | null
   count: number
   points: PhotoPoint[]
+  takenThrough?: string
+  roleCounts?: {
+    local: number
+    tourist: number
+    unknown: number
+  }
+  roleMethod?: string
+  ownerHomesAt?: string
 }
 
 export type PopulationRateCell = {
@@ -34,6 +59,12 @@ export type PopulationRateCell = {
   photos: number
   population: number
   photosPerThousand: number
+  country?: string | null
+  touristPhotos?: number
+  localPhotos?: number
+  flickrUsers?: number
+  /** EB-shrunk photos per national Flickr home-user. */
+  photosPerFlickrUser?: number
 }
 
 export type PopulationRateDataset = {
@@ -42,6 +73,15 @@ export type PopulationRateDataset = {
   populationYear: number
   cellDegrees: number
   populationFloor: number
+  /** Empirical Bayes global mean (photos per resident). */
+  ebMean?: number
+  /** Empirical Bayes prior strength C (in residents). */
+  ebStrength?: number
+  flickrEbMean?: number
+  flickrEbStrength?: number
+  flickrUsersByCountry?: Record<string, number>
+  /** Minimum photos required for Capita display / ranking. */
+  minPhotos?: number
   cells: PopulationRateCell[]
 }
 
@@ -83,13 +123,46 @@ export async function loadDataset(): Promise<PhotoDataset> {
   return (await res.json()) as PhotoDataset
 }
 
+/** Attach EB params and rewrite Capita rates from photos + population. */
+export function withEmpiricalBayesRates(
+  dataset: PopulationRateDataset,
+): PopulationRateDataset {
+  const floor = dataset.populationFloor ?? 1_000
+  const minPhotos = dataset.minPhotos ?? CAPITA_MIN_PHOTOS
+  const params: EbParams =
+    dataset.ebMean !== undefined && dataset.ebStrength !== undefined
+      ? { mean: dataset.ebMean, strength: dataset.ebStrength }
+      : estimateEbParams(dataset.cells, floor)
+
+  return {
+    ...dataset,
+    ebMean: params.mean,
+    ebStrength: params.strength,
+    minPhotos,
+    cells: dataset.cells.map((cell) => ({
+      ...cell,
+      photosPerThousand:
+        cell.photos >= minPhotos
+          ? Number(
+              ebPhotosPerThousand(
+                cell.photos,
+                cell.population,
+                params,
+                floor,
+              ).toFixed(4),
+            )
+          : 0,
+    })),
+  }
+}
+
 /** Load the offline-prepared population / photo-rate grid (GHSL 2020). */
 export async function loadPopulationRates(): Promise<PopulationRateDataset> {
   const res = await fetch(POPULATION_RATE_URL)
   if (!res.ok) {
     throw new Error(`Failed to load population rate grid (HTTP ${res.status})`)
   }
-  return (await res.json()) as PopulationRateDataset
+  return withEmpiricalBayesRates((await res.json()) as PopulationRateDataset)
 }
 
 export type HotspotPlaceLabels = Record<string, string | null>
@@ -119,18 +192,31 @@ export function applyPlaceLabels(
 
 /** Grid-cluster points; return the densest cells as pin hotspots, spread globally. */
 export function findHotspots(points: PhotoPoint[], limit = 12, cellDeg = 1.5): Hotspot[] {
-  type Cell = { latSum: number; lonSum: number; count: number; best: PhotoPoint }
+  type Cell = {
+    latSum: number
+    lonSum: number
+    count: number
+    owners: Set<string>
+    best: PhotoPoint
+  }
   const cells = new Map<string, Cell>()
 
   for (const p of points) {
     const key = `${Math.floor(p.lat / cellDeg)},${Math.floor(p.lon / cellDeg)}`
     const existing = cells.get(key)
     if (!existing) {
-      cells.set(key, { latSum: p.lat, lonSum: p.lon, count: 1, best: p })
+      cells.set(key, {
+        latSum: p.lat,
+        lonSum: p.lon,
+        count: 1,
+        owners: new Set(p.owner ? [p.owner] : []),
+        best: p,
+      })
     } else {
       existing.latSum += p.lat
       existing.lonSum += p.lon
       existing.count += 1
+      if (p.owner) existing.owners.add(p.owner)
       if (p.views > existing.best.views) existing.best = p
     }
   }
@@ -140,6 +226,7 @@ export function findHotspots(points: PhotoPoint[], limit = 12, cellDeg = 1.5): H
       lat: c.latSum / c.count,
       lon: c.lonSum / c.count,
       count: c.count,
+      photographers: c.owners.size || undefined,
       sample: c.best,
     }))
     .sort((a, b) => b.count - a.count)
@@ -167,9 +254,10 @@ export function findHotspots(points: PhotoPoint[], limit = 12, cellDeg = 1.5): H
 }
 
 /**
- * Rank photography clusters by photos per 1,000 residents instead of raw count.
+ * Rank photography clusters by EB-shrunk photos per 1,000 residents.
  * Population and photos are aggregated into the same coarse cells used by
  * findHotspots, then geographically spread so one region cannot fill the list.
+ * Cells below CAPITA_MIN_PHOTOS are excluded so sparse deserts cannot dominate.
  */
 export function findPerCapitaHotspots(
   points: PhotoPoint[],
@@ -187,6 +275,16 @@ export function findPerCapitaHotspots(
   const cells = new Map<string, Cell>()
   const keyFor = (lat: number, lon: number) =>
     `${Math.floor(lat / cellDeg)},${Math.floor(lon / cellDeg)}`
+  const floor = populationRates.populationFloor ?? 1_000
+  const minPhotos = populationRates.minPhotos ?? CAPITA_MIN_PHOTOS
+  const eb: EbParams =
+    populationRates.ebMean !== undefined &&
+    populationRates.ebStrength !== undefined
+      ? {
+          mean: populationRates.ebMean,
+          strength: populationRates.ebStrength,
+        }
+      : estimateEbParams(populationRates.cells, floor)
 
   for (const cell of populationRates.cells) {
     const key = keyFor(cell.lat, cell.lon)
@@ -216,14 +314,20 @@ export function findPerCapitaHotspots(
   }
 
   const ranked = [...cells.values()]
-    .filter((cell): cell is Cell & { best: PhotoPoint } => cell.count > 0 && !!cell.best)
+    .filter(
+      (cell): cell is Cell & { best: PhotoPoint } =>
+        cell.count >= minPhotos && !!cell.best,
+    )
     .map((cell) => ({
       lat: cell.latSum / cell.count,
       lon: cell.lonSum / cell.count,
       count: cell.count,
-      photosPerThousand:
-        (cell.count * 1_000) /
-        Math.max(cell.population, populationRates.populationFloor),
+      photosPerThousand: ebPhotosPerThousand(
+        cell.count,
+        cell.population,
+        eb,
+        floor,
+      ),
       sample: cell.best,
     }))
     .sort((a, b) => b.photosPerThousand - a.photosPerThousand)
@@ -232,7 +336,120 @@ export function findPerCapitaHotspots(
   const minSepDeg = 12
   for (const candidate of ranked) {
     const tooClose = picked.some(
-      (item) => Math.hypot(item.lat - candidate.lat, item.lon - candidate.lon) < minSepDeg,
+      (item) =>
+        Math.hypot(item.lat - candidate.lat, item.lon - candidate.lon) <
+        minSepDeg,
+    )
+    if (!tooClose) picked.push(candidate)
+    if (picked.length >= limit) break
+  }
+
+  for (const candidate of ranked) {
+    if (picked.length >= limit) break
+    if (!picked.includes(candidate)) picked.push(candidate)
+  }
+
+  return picked.map((cell, index) => ({
+    ...cell,
+    color: PIN_COLORS[index % PIN_COLORS.length],
+    placeName: formatCoords(cell.lat, cell.lon),
+  }))
+}
+
+/**
+ * Rank clusters by EB-shrunk photos per national Flickr home-user base.
+ */
+export function findFlickrShareHotspots(
+  points: PhotoPoint[],
+  populationRates: PopulationRateDataset,
+  limit = 12,
+  cellDeg = 1.5,
+): Hotspot[] {
+  type Cell = {
+    latSum: number
+    lonSum: number
+    count: number
+    flickrUsers: number
+    best?: PhotoPoint
+  }
+  const cells = new Map<string, Cell>()
+  const keyFor = (lat: number, lon: number) =>
+    `${Math.floor(lat / cellDeg)},${Math.floor(lon / cellDeg)}`
+  const minPhotos = populationRates.minPhotos ?? CAPITA_MIN_PHOTOS
+  const eb: EbParams =
+    populationRates.flickrEbMean !== undefined &&
+    populationRates.flickrEbStrength !== undefined
+      ? {
+          mean: populationRates.flickrEbMean,
+          strength: populationRates.flickrEbStrength,
+        }
+      : estimateEbParams(
+          populationRates.cells
+            .filter((cell) => cell.photos > 0 && (cell.flickrUsers ?? 0) > 0)
+            .map((cell) => ({
+              photos: cell.photos,
+              population: Math.max(cell.flickrUsers ?? 1, 1),
+            })),
+          1,
+        )
+
+  for (const cell of populationRates.cells) {
+    const key = keyFor(cell.lat, cell.lon)
+    const existing = cells.get(key)
+    const flickrUsers = cell.flickrUsers ?? 0
+    if (existing) {
+      existing.flickrUsers = Math.max(existing.flickrUsers, flickrUsers)
+    } else {
+      cells.set(key, {
+        latSum: 0,
+        lonSum: 0,
+        count: 0,
+        flickrUsers,
+      })
+    }
+  }
+
+  for (const point of points) {
+    const key = keyFor(point.lat, point.lon)
+    const existing = cells.get(key)
+    if (!existing) continue
+    existing.latSum += point.lat
+    existing.lonSum += point.lon
+    existing.count += 1
+    if (!existing.best || point.views > existing.best.views) {
+      existing.best = point
+    }
+  }
+
+  const ranked = [...cells.values()]
+    .filter(
+      (cell): cell is Cell & { best: PhotoPoint } =>
+        cell.count >= minPhotos && !!cell.best,
+    )
+    .map((cell) => ({
+      lat: cell.latSum / cell.count,
+      lon: cell.lonSum / cell.count,
+      count: cell.count,
+      photosPerThousand:
+        ebPhotosPerThousand(
+          cell.count,
+          Math.max(cell.flickrUsers, 1),
+          eb,
+          1,
+        ) / 1000,
+      sample: cell.best,
+    }))
+    .sort(
+      (a, b) => (b.photosPerThousand ?? 0) - (a.photosPerThousand ?? 0),
+    )
+
+  const picked: typeof ranked = []
+  const minSepDeg = 12
+  for (const candidate of ranked) {
+    const tooClose = picked.some(
+      (item) =>
+        Math.hypot(item.lat - candidate.lat, item.lon - candidate.lon) <
+        minSepDeg,
     )
     if (!tooClose) picked.push(candidate)
     if (picked.length >= limit) break

@@ -27,6 +27,12 @@ import type {
   PhotoPoint,
   PopulationRateDataset,
 } from './flickr'
+import {
+  CAPITA_MIN_PHOTOS,
+  ebPhotosPerThousand,
+  estimateEbParams,
+  type EbParams,
+} from './rates'
 
 type Props = {
   points: PhotoPoint[]
@@ -39,6 +45,9 @@ type Props = {
   panRequest?: MapPanRequest | null
   onSelectFocus?: (focus: MapFocus) => void
   onMetricModeChange?: (metric: MetricMode) => void
+  audienceMode?: AudienceMode
+  onAudienceModeChange?: (audience: AudienceMode) => void
+  hasAudienceRoles?: boolean
   showHottestMarkers?: boolean
   showMostViewedMarkers?: boolean
   onShowHottestMarkersChange?: (show: boolean) => void
@@ -76,6 +85,10 @@ export function flickrPhotoUrl(id: string): string {
 
 export function focusFromHotspot(h: Hotspot): MapFocus {
   const photosPerThousand = h.photosPerThousand
+  const photographers =
+    h.photographers !== undefined
+      ? ` · ${h.photographers.toLocaleString()} photographers`
+      : ''
   return {
     id: `hotspot:${h.lat},${h.lon}`,
     lon: h.lon,
@@ -83,8 +96,8 @@ export function focusFromHotspot(h: Hotspot): MapFocus {
     label: h.placeName,
     color: h.color,
     subtitle: photosPerThousand !== undefined
-      ? `${photosPerThousand.toFixed(1)} photos per 1,000 residents`
-      : `${h.count.toLocaleString()} photos in this area`,
+      ? `${photosPerThousand.toFixed(1)} photos / 1k residents (stabilized)`
+      : `${h.count.toLocaleString()} photos${photographers}`,
     photo: {
       id: h.sample.id,
       title: h.sample.title || 'Untitled',
@@ -161,18 +174,24 @@ function basemap(theme: ThemeMode) {
 }
 
 type ViewMode = 'hex' | 'points'
-type MetricMode = 'photos' | 'population' | 'per-capita'
+type MetricMode = 'photos' | 'population' | 'per-capita' | 'flickr-share'
+export type AudienceMode = 'all' | 'local' | 'tourist' | 'unknown'
 type ProjectionMode = 'mercator' | 'equal-earth'
 type ThemeMode = 'dark' | 'light'
 type XY = [number, number]
 type Rgba = [number, number, number, number]
 type ProjectedPoint = { source: PhotoPoint; position: XY; color: Rgba }
 type ProjectedHotspot = { source: Hotspot; position: XY }
-type MetricField = 'photos' | 'population' | 'photosPerThousand'
+type MetricField =
+  | 'photos'
+  | 'population'
+  | 'photosPerThousand'
+  | 'photosPerFlickrUser'
 
 function metricField(metric: MetricMode): MetricField {
   if (metric === 'population') return 'population'
   if (metric === 'per-capita') return 'photosPerThousand'
+  if (metric === 'flickr-share') return 'photosPerFlickrUser'
   return 'photos'
 }
 
@@ -193,7 +212,10 @@ function metricLegendLabels(metric: MetricMode): {
     return { title: 'Population', low: 'Low', high: 'High' }
   }
   if (metric === 'per-capita') {
-    return { title: 'Per capita', low: 'Low', high: 'High' }
+    return { title: 'Per resident (stabilized)', low: 'Low', high: 'High' }
+  }
+  if (metric === 'flickr-share') {
+    return { title: 'Per Flickr user (stabilized)', low: 'Low', high: 'High' }
   }
   return { title: 'Density', low: 'Low', high: 'High' }
 }
@@ -204,7 +226,10 @@ function metricHint(viewMode: ViewMode, metric: MetricMode): string {
       return 'Shared hex grid · GHSL resident population (2020)'
     }
     if (metric === 'per-capita') {
-      return 'Same hexes · photos per 1,000 residents'
+      return 'Same hexes · EB-shrunk photos per resident · not tourist volume'
+    }
+    if (metric === 'flickr-share') {
+      return 'Same hexes · photos / national Flickr home-user base'
     }
     return 'Same hexes · brighter = more photos'
   }
@@ -212,7 +237,10 @@ function metricHint(viewMode: ViewMode, metric: MetricMode): string {
     return 'One point per 0.25° cell · GHSL resident population (2020)'
   }
   if (metric === 'per-capita') {
-    return 'Points colored by photos per 1,000 residents · GHSL 2020'
+    return 'Over-photographed vs who lives there (EB-stabilized) · GHSL 2020'
+  }
+  if (metric === 'flickr-share') {
+    return 'Normalized by Flickr users whose home is that country'
   }
   return 'Points · amber→hot · brighter = denser area'
 }
@@ -323,9 +351,47 @@ function cellsForMetric(
   metric: MetricMode,
 ) {
   // Shared 0.25° tessellation for every hex metric. World pop uses the full
-  // inhabited grid; photo count and per-capita share the photographed cells.
+  // inhabited grid; photo metrics share the photographed cells.
   if (metric === 'population') return dataset.cells
+  if (metric === 'per-capita' || metric === 'flickr-share') {
+    const minPhotos = dataset.minPhotos ?? CAPITA_MIN_PHOTOS
+    return dataset.cells.filter((cell) => cell.photos >= minPhotos)
+  }
   return dataset.cells.filter((cell) => cell.photos > 0)
+}
+
+function datasetEbParams(dataset: PopulationRateDataset | null): EbParams {
+  const floor = dataset?.populationFloor ?? 1_000
+  if (
+    dataset?.ebMean !== undefined &&
+    dataset?.ebStrength !== undefined
+  ) {
+    return { mean: dataset.ebMean, strength: dataset.ebStrength }
+  }
+  if (!dataset) return { mean: 0, strength: floor }
+  return estimateEbParams(dataset.cells, floor)
+}
+
+function datasetFlickrEbParams(dataset: PopulationRateDataset | null): EbParams {
+  if (
+    dataset?.flickrEbMean !== undefined &&
+    dataset?.flickrEbStrength !== undefined
+  ) {
+    return {
+      mean: dataset.flickrEbMean,
+      strength: dataset.flickrEbStrength,
+    }
+  }
+  if (!dataset) return { mean: 0, strength: 1 }
+  return estimateEbParams(
+    dataset.cells
+      .filter((cell) => (cell.photos ?? 0) > 0 && (cell.flickrUsers ?? 0) > 0)
+      .map((cell) => ({
+        photos: cell.photos,
+        population: Math.max(cell.flickrUsers ?? 1, 1),
+      })),
+    1,
+  )
 }
 
 function metricCap(
@@ -334,7 +400,7 @@ function metricCap(
   metric: MetricMode,
 ): number {
   const sorted = cellsForMetric(dataset, metric)
-    .map((cell) => cell[field])
+    .map((cell) => cell[field] ?? 0)
     .sort((a, b) => a - b)
   return sorted[Math.floor(sorted.length * 0.97)] ?? 1
 }
@@ -355,6 +421,7 @@ type HexAggregates = {
   r: number[]
   photos: number[]
   population: number[]
+  flickrUsers: number[]
 }
 
 type MetricHex = {
@@ -400,24 +467,26 @@ function toFlatPositions(
   return out
 }
 
-/** Flat [x, y, population] triples, 2×2 sub-samples per source cell. */
+/** Flat [x, y, population, flickrUsers] quads, 2×2 sub-samples per source cell. */
 function toFlatPopulationSamples(
   dataset: PopulationRateDataset | null,
   toSpace: (lon: number, lat: number) => XY,
 ): Float64Array | null {
   if (!dataset) return null
   const offset = dataset.cellDegrees / 4
-  const out = new Float64Array(dataset.cells.length * 4 * 3)
+  const out = new Float64Array(dataset.cells.length * 4 * 4)
   let at = 0
   for (const cell of dataset.cells) {
     const share = cell.population / 4
+    const flickrUsers = cell.flickrUsers ?? 0
     for (const dLon of [-offset, offset]) {
       for (const dLat of [-offset, offset]) {
         const [x, y] = toSpace(cell.lon + dLon, cell.lat + dLat)
         out[at] = x
         out[at + 1] = y
         out[at + 2] = share
-        at += 3
+        out[at + 3] = flickrUsers
+        at += 4
       }
     }
   }
@@ -434,6 +503,7 @@ function aggregateHexes(
   const r: number[] = []
   const photos: number[] = []
   const population: number[] = []
+  const flickrUsers: number[] = []
 
   // Pointy-top axial coordinates, rounded through cube space. Returns -1 for
   // samples the projection dropped (clipped or undefined).
@@ -461,6 +531,7 @@ function aggregateHexes(
       r.push(rz)
       photos.push(0)
       population.push(0)
+      flickrUsers.push(0)
     }
     return at
   }
@@ -470,13 +541,18 @@ function aggregateHexes(
     if (at >= 0) photos[at] += 1
   }
   if (populationSamples) {
-    for (let i = 0; i < populationSamples.length; i += 3) {
+    for (let i = 0; i < populationSamples.length; i += 4) {
       const at = binAt(populationSamples[i], populationSamples[i + 1])
-      if (at >= 0) population[at] += populationSamples[i + 2]
+      if (at >= 0) {
+        population[at] += populationSamples[i + 2]
+        // National Flickr-user counts are constant within a country; take max
+        // so border hexes keep a usable denominator.
+        flickrUsers[at] = Math.max(flickrUsers[at], populationSamples[i + 3])
+      }
     }
   }
 
-  return { radius, q, r, photos, population }
+  return { radius, q, r, photos, population, flickrUsers }
 }
 
 function buildMetricHexes(
@@ -485,8 +561,11 @@ function buildMetricHexes(
   populationFloor: number,
   toVertex: (x: number, y: number) => [number, number],
   theme: ThemeMode = 'dark',
+  eb: EbParams = { mean: 0, strength: populationFloor },
+  minPhotos = CAPITA_MIN_PHOTOS,
+  flickrEb: EbParams = { mean: 0, strength: 1 },
 ): MetricHex[] {
-  const { radius, q, r, photos, population } = aggregates
+  const { radius, q, r, photos, population, flickrUsers } = aggregates
   const keep: number[] = []
   const values: number[] = []
 
@@ -499,12 +578,29 @@ function buildMetricHexes(
       continue
     }
     if (photos[i] <= 0) continue
+    if (
+      (metric === 'per-capita' || metric === 'flickr-share') &&
+      photos[i] < minPhotos
+    ) {
+      continue
+    }
     keep.push(i)
-    values.push(
-      metric === 'per-capita'
-        ? (photos[i] * 1_000) / Math.max(population[i], populationFloor)
-        : photos[i],
-    )
+    if (metric === 'per-capita') {
+      values.push(
+        ebPhotosPerThousand(photos[i], population[i], eb, populationFloor),
+      )
+    } else if (metric === 'flickr-share') {
+      values.push(
+        ebPhotosPerThousand(
+          photos[i],
+          Math.max(flickrUsers[i], 1),
+          flickrEb,
+          1,
+        ) / 1000,
+      )
+    } else {
+      values.push(photos[i])
+    }
   }
 
   const sorted = [...values].sort((a, b) => a - b)
@@ -562,7 +658,10 @@ function buildPointMetricColors(
   const cap = metricCap(dataset, field, metric)
   const lookup = new Map<string, number>()
   for (const cell of cellsForMetric(dataset, metric)) {
-    lookup.set(cellCenterKey(cell.lat, cell.lon, dataset.cellDegrees), cell[field])
+    lookup.set(
+      cellCenterKey(cell.lat, cell.lon, dataset.cellDegrees),
+      cell[field] ?? 0,
+    )
   }
 
   return points.map((point) => {
@@ -731,6 +830,9 @@ export function MapView({
   panRequest = null,
   onSelectFocus,
   onMetricModeChange,
+  audienceMode: audienceModeProp = 'all',
+  onAudienceModeChange,
+  hasAudienceRoles = false,
   showHottestMarkers = true,
   showMostViewedMarkers = true,
   onShowHottestMarkersChange,
@@ -738,12 +840,17 @@ export function MapView({
 }: Props) {
   const [viewMode, setViewMode] = useState<ViewMode>('hex')
   const [metricMode, setMetricMode] = useState<MetricMode>('photos')
+  const [audienceMode, setAudienceMode] = useState<AudienceMode>(audienceModeProp)
   const [projectionMode, setProjectionMode] =
     useState<ProjectionMode>('mercator')
   const [themeMode, setThemeMode] = useState<ThemeMode>('dark')
   const [exporting, setExporting] = useState(false)
   const legend = metricLegendLabels(metricMode)
   const palette = densityColors(themeMode)
+
+  useEffect(() => {
+    setAudienceMode(audienceModeProp)
+  }, [audienceModeProp])
 
   useEffect(() => {
     document.documentElement.dataset.theme = themeMode
@@ -864,6 +971,9 @@ export function MapView({
                 { value: 'photos', label: 'Photos' },
                 { value: 'population', label: 'Pop' },
                 { value: 'per-capita', label: 'Capita' },
+                ...(populationRates.flickrUsersByCountry
+                  ? [{ value: 'flickr-share', label: 'Flickr' }]
+                  : []),
               ]}
               value={metricMode}
             onChange={(value) => {
@@ -871,6 +981,24 @@ export function MapView({
               setMetricMode(nextMetric)
               onMetricModeChange?.(nextMetric)
             }}
+            />
+          )}
+          {hasAudienceRoles && (
+            <ToggleGroup
+              label="Who"
+              compact
+              options={[
+                { value: 'all', label: 'All' },
+                { value: 'local', label: 'Local' },
+                { value: 'tourist', label: 'Tourist' },
+                { value: 'unknown', label: 'Unknown' },
+              ]}
+              value={audienceMode}
+              onChange={(value) => {
+                const next = value as AudienceMode
+                setAudienceMode(next)
+                onAudienceModeChange?.(next)
+              }}
             />
           )}
           <ToggleGroup
@@ -899,12 +1027,12 @@ export function MapView({
             aria-pressed={showHottestMarkers}
             title={
               metricMode === 'per-capita'
-                ? 'Toggle highest per-capita cluster markers'
+                ? 'Toggle highest photos-per-resident cluster markers'
                 : 'Toggle hottest cluster markers'
             }
             onClick={() => onShowHottestMarkersChange?.(!showHottestMarkers)}
           >
-            {metricMode === 'per-capita' ? 'Per capita' : 'Hottest'}
+            {metricMode === 'per-capita' ? 'Per resident' : 'Hottest'}
           </button>
           <button
             type="button"
@@ -948,6 +1076,11 @@ export function MapView({
       <p className="map-credit">
         Built by kobakhit · © Natural Earth · © OSM · © CARTO · Flickr · deck.gl
         · population: GHSL GHS-POP R2023A (EC JRC)
+        {metricMode === 'per-capita'
+          ? ' · Capita = EB-shrunk photos / residents (not tourist volume)'
+          : metricMode === 'flickr-share'
+            ? ' · Flickr = photos / national Flickr home-user base'
+            : ''}
       </p>
     </div>
   )
@@ -1095,8 +1228,16 @@ function MercatorMap({
         populationRates?.populationFloor ?? 1_000,
         fromMercatorWorld,
         themeMode,
+        datasetEbParams(populationRates),
+        populationRates?.minPhotos ?? CAPITA_MIN_PHOTOS,
+        datasetFlickrEbParams(populationRates),
       ),
-    [hexAggregates, metricMode, populationRates?.populationFloor, themeMode],
+    [
+      hexAggregates,
+      metricMode,
+      populationRates,
+      themeMode,
+    ],
   )
   // Hexes only in hex view (until deep zoom). Points view always shows points —
   // World pop uses one dot per inhabited cell (also used as the hex handoff).
@@ -1478,8 +1619,11 @@ function EqualEarthMap({
         // Already in Equal Earth space; hand the vertex through untouched.
         (x, y) => [x, y],
         themeMode,
+        datasetEbParams(populationRates),
+        populationRates?.minPhotos ?? CAPITA_MIN_PHOTOS,
+        datasetFlickrEbParams(populationRates),
       ),
-    [hexAggregates, metricMode, populationRates?.populationFloor, themeMode],
+    [hexAggregates, metricMode, populationRates, themeMode],
   )
 
   const layers = useMemo(() => {
@@ -2180,6 +2324,9 @@ function drawExportHexes(
     dataset?.populationFloor ?? 1_000,
     (x, y) => [x, y],
     theme,
+    datasetEbParams(dataset),
+    dataset?.minPhotos ?? CAPITA_MIN_PHOTOS,
+    datasetFlickrEbParams(dataset),
   )
 
   // Batch by color so the 8K canvas isn't restyled per hex.
@@ -2418,12 +2565,14 @@ function drawExportControls(
     x + 420,
     y + 38,
     'METRIC',
-    ['Photo count', 'World pop', 'Per capita'],
+    ['Photo count', 'World pop', 'Per resident', 'Flickr'],
     options.metricMode === 'photos'
       ? 0
       : options.metricMode === 'population'
         ? 1
-        : 2,
+        : options.metricMode === 'per-capita'
+          ? 2
+          : 3,
     155,
   )
   drawExportToggle(
@@ -2439,7 +2588,7 @@ function drawExportControls(
     context,
     x + 1265,
     y + 38,
-    normalizedHotspots ? 'PER CAPITA' : 'HOTTEST',
+    normalizedHotspots ? 'PER RESIDENT' : 'HOTTEST',
     ['Show', 'Hide'],
     options.showHottestMarkers === false ? 1 : 0,
     120,
@@ -2525,7 +2674,7 @@ async function drawExportPanels(
     drawPanel(context, leftX, y, panelWidth, panelHeight)
     drawPanelTitle(
       context,
-      normalizedHotspots ? 'HIGHEST PER CAPITA' : 'HOTTEST CLUSTERS',
+      normalizedHotspots ? 'HIGHEST PER RESIDENT' : 'HOTTEST CLUSTERS',
       leftX + padding,
       y + 62,
     )
@@ -2540,7 +2689,9 @@ async function drawExportPanels(
         hotspot.placeName,
         normalizedHotspots
           ? `${hotspot.photosPerThousand?.toFixed(1) ?? '0.0'}/1k`
-          : hotspot.count.toLocaleString(),
+          : hotspot.photographers !== undefined
+            ? `${hotspot.count.toLocaleString()} · ${hotspot.photographers.toLocaleString()}p`
+            : hotspot.count.toLocaleString(),
         leftX + padding + 45,
         rowY,
         panelWidth - padding * 2 - 45,

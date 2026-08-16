@@ -128,8 +128,8 @@ def build_infographic(
 
 hex_panels = [
     (
-        "Photos per capita",
-        "Photos per 1,000 residents",
+        "Photos per resident",
+        "EB-shrunk · GHSL residents 2020",
         source("flickr-2026-hex-per-capita-equal-earth-8k.png"),
     ),
     (
@@ -148,8 +148,8 @@ hex_panels = [
 def points_panels() -> list[tuple[str, str, Path]]:
     return [
         (
-            "Photos per capita",
-            "Photos per 1,000 residents",
+            "Photos per resident",
+            "EB-shrunk · GHSL residents 2020",
             source("flickr-2026-points-per-capita-equal-earth-8k.png"),
         ),
         (

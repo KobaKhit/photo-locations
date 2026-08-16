@@ -5,7 +5,12 @@
   "type": "module",
   "scripts": {
     "download": "node scripts/download.mjs",
+    "download:update": "node scripts/download.mjs --update",
+    "download:refresh": "node scripts/download.mjs --refresh",
     "population": "node scripts/prepare-population.mjs",
+    "prepare-owners": "node scripts/prepare-owners.mjs",
+    "recompute-capita": "node scripts/recompute-capita-rates.mjs",
+    "strip-null-island": "node scripts/strip-null-island.mjs",
     "hotspot-places": "node scripts/resolve-hotspot-places.mjs",
     "dev": "vite",
     "build": "tsc -b && vite build",
