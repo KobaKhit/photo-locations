@@ -708,16 +708,27 @@ export function MapView({
       await new Promise<void>((resolve) =>
         requestAnimationFrame(() => resolve()),
       )
-      await downloadHighResMap(points, hotspots, mostViewed, {
-        viewMode,
-        metricMode,
-        projectionMode,
-        downloadedAt,
-        selectedFocus,
-        populationRates,
-        showHottestMarkers,
-        showMostViewedMarkers,
-      })
+      const batchSizes = readHexExportBatchSizes()
+      const sizes =
+        viewMode === 'hex' && batchSizes.length > 0
+          ? batchSizes
+          : [undefined]
+      for (const hexDegrees of sizes) {
+        await downloadHighResMap(points, hotspots, mostViewed, {
+          viewMode,
+          metricMode,
+          projectionMode,
+          downloadedAt,
+          selectedFocus,
+          populationRates,
+          showHottestMarkers,
+          showMostViewedMarkers,
+          hexDegrees,
+        })
+      }
+      if (batchSizes.length > 0) {
+        document.body.dataset.hexExportsDone = String(batchSizes.length)
+      }
     } catch (error) {
       console.error('High-resolution export failed', error)
       window.alert('Could not render the 8K image. Please try again.')
@@ -1734,6 +1745,26 @@ function formatAsOfDate(iso?: string): string | null {
   })
 }
 
+/** Optional batch sizes from ?batchHex=0.4,0.5,0.6 or window.__hexExportDegrees. */
+function readHexExportBatchSizes(): number[] {
+  const fromWindow = (
+    window as Window & { __hexExportDegrees?: number[] }
+  ).__hexExportDegrees
+  if (Array.isArray(fromWindow) && fromWindow.length > 0) {
+    return fromWindow.filter((n) => Number.isFinite(n) && n > 0)
+  }
+  const param = new URLSearchParams(window.location.search).get('batchHex')
+  if (!param) return []
+  return param
+    .split(',')
+    .map((part) => Number(part.trim()))
+    .filter((n) => Number.isFinite(n) && n > 0)
+}
+
+function hexDegreesLabel(degrees: number): string {
+  return String(degrees).replace('.', 'p')
+}
+
 async function downloadHighResMap(
   points: PhotoPoint[],
   hotspots: Hotspot[],
@@ -1747,6 +1778,7 @@ async function downloadHighResMap(
     populationRates?: PopulationRateDataset | null
     showHottestMarkers?: boolean
     showMostViewedMarkers?: boolean
+    hexDegrees?: number
   },
 ): Promise<void> {
   const width = 7680
@@ -1803,6 +1835,7 @@ async function downloadHighResMap(
       projection,
       options.metricMode,
       options.populationRates ?? null,
+      options.hexDegrees,
     )
   } else if (
     options.metricMode === 'population' &&
@@ -1879,10 +1912,24 @@ async function downloadHighResMap(
       else reject(new Error('PNG encoding failed'))
     }, 'image/png')
   })
+  const filename = `flickr-2026-${options.viewMode}-${options.metricMode}-${options.projectionMode}-8k${
+    options.hexDegrees !== undefined
+      ? `-${hexDegreesLabel(options.hexDegrees)}deg`
+      : ''
+  }.png`
+  const sink = (
+    window as Window & {
+      __hexExportSink?: (blob: Blob, filename: string) => Promise<void> | void
+    }
+  ).__hexExportSink
+  if (sink) {
+    await sink(blob, filename)
+    return
+  }
   const url = URL.createObjectURL(blob)
   const link = document.createElement('a')
   link.href = url
-  link.download = `flickr-2026-${options.viewMode}-${options.metricMode}-${options.projectionMode}-8k.png`
+  link.download = filename
   link.click()
   window.setTimeout(() => URL.revokeObjectURL(url), 30_000)
 }
@@ -2007,8 +2054,8 @@ function drawExportPopulationPoints(
   context.restore()
 }
 
-/** Hex size for exports, chosen to match the default world view on screen. */
-const EXPORT_HEX_DEGREES = 0.8
+/** Default hex size for exports: balanced world-view grain. */
+const EXPORT_HEX_DEGREES = 0.5
 
 function drawExportHexes(
   context: CanvasRenderingContext2D,
@@ -2016,6 +2063,7 @@ function drawExportHexes(
   projection: GeoProjection,
   metric: MetricMode,
   dataset: PopulationRateDataset | null,
+  hexDegrees?: number,
 ) {
   const toSpace = (lon: number, lat: number): XY =>
     (projection([lon, lat]) as XY | null) ?? [NaN, NaN]
@@ -2023,8 +2071,10 @@ function drawExportHexes(
   const eastward = projection([1, 0])
   const pixelsPerDegree =
     origin && eastward ? Math.abs(eastward[0] - origin[0]) : 21
-  const radius =
-    Math.max(EXPORT_HEX_DEGREES, dataset?.cellDegrees ?? 0) * pixelsPerDegree
+  const degrees =
+    hexDegrees ??
+    Math.max(EXPORT_HEX_DEGREES, dataset?.cellDegrees ?? EXPORT_HEX_DEGREES)
+  const radius = degrees * pixelsPerDegree
 
   const hexes = buildMetricHexes(
     aggregateHexes(

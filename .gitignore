@@ -23,6 +23,9 @@ public/data/*.tmp
 !public/data/photo-rates-per-capita-2026.json
 !public/data/hotspot-places-2026.json
 
+# Local 8K comparison exports
+exports/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
