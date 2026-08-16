@@ -17,6 +17,7 @@ dist-ssr
 
 # Downloaded Flickr datasets — keep the shipped snapshot via LFS
 public/data/*.json
+public/data/*.json.gz
 public/data/*.tmp
 !public/data/.gitkeep
 !public/data/photos-2026.json

@@ -111,9 +111,17 @@ const HOTSPOT_PLACES_URL = `${import.meta.env.BASE_URL}data/hotspot-places-2026.
   '$1',
 )
 
-/** Load previously downloaded Flickr points from disk (served via /public). */
-export async function loadDataset(): Promise<PhotoDataset> {
-  const res = await fetch(DATA_URL)
+/** Prefer gzip on Pages (file exceeds GitHub’s 100 MB limit uncompressed). */
+async function fetchJsonDataset(url: string): Promise<PhotoDataset> {
+  const gzUrl = url.replace(/\.json$/i, '.json.gz')
+  const gzRes = await fetch(gzUrl)
+  if (gzRes.ok && gzRes.body && typeof DecompressionStream !== 'undefined') {
+    const stream = gzRes.body.pipeThrough(new DecompressionStream('gzip'))
+    const text = await new Response(stream).text()
+    return JSON.parse(text) as PhotoDataset
+  }
+
+  const res = await fetch(url)
   if (res.status === 404) {
     throw new Error(
       'No data yet. Run `npm run download` first to fetch Flickr photos to public/data/photos-2026.json',
@@ -121,6 +129,11 @@ export async function loadDataset(): Promise<PhotoDataset> {
   }
   if (!res.ok) throw new Error(`Failed to load dataset (HTTP ${res.status})`)
   return (await res.json()) as PhotoDataset
+}
+
+/** Load previously downloaded Flickr points from disk (served via /public). */
+export async function loadDataset(): Promise<PhotoDataset> {
+  return fetchJsonDataset(DATA_URL)
 }
 
 /** Attach EB params and rewrite Capita rates from photos + population. */

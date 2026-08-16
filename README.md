@@ -60,7 +60,7 @@ Open the URL Vite prints. The map reads only the saved JSON — no live Flickr c
 npm run deploy
 ```
 
-Builds and pushes `dist/` to the `gh-pages` branch (GitHub Pages).
+Builds and pushes `dist/` to the `gh-pages` branch (GitHub Pages). The photo dataset is published as `photos-2026.json.gz` so it stays under GitHub’s 100 MB file limit.
 
 ## Env
 

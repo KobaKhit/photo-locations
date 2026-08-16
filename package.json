@@ -16,7 +16,7 @@
     "build": "tsc -b && vite build",
     "lint": "oxlint",
     "preview": "vite preview",
-    "deploy": "npm run build && gh-pages -d dist"
+    "deploy": "node scripts/deploy-pages.mjs"
   },
   "dependencies": {
     "@deck.gl/react": "^9.3.10",
