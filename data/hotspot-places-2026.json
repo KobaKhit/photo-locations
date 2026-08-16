@@ -1,0 +1,30 @@
+{
+  "source": "Nominatim",
+  "language": "en",
+  "labels": {
+    "33.860,-118.019": "Orange County, California",
+    "14.313,120.994": "Dasmariñas, Cavite",
+    "59.118,5.547": "Rogaland, Norway",
+    "34.369,132.483": "Hiroshima Prefecture, Japan",
+    "49.192,-123.202": "Metro Vancouver Regional District, British Columbia",
+    "38.789,-77.109": "Fairfax County, Virginia",
+    "-12.516,33.483": "Kasungu, Malawi",
+    "-34.962,138.626": "South Australia, Australia",
+    "-34.623,-58.371": "Distrito de Las Artes, Argentina",
+    "-15.807,-47.849": "Federal District, Brazil",
+    "10.467,-66.857": "Municipio Baruta, Miranda State",
+    "-32.065,115.842": "Western Australia, Australia",
+    "61.145,-133.091": "Yukon, Canada",
+    "-25.744,113.515": "Western Australia, Australia",
+    "-17.482,140.828": "Queensland, Australia",
+    "-51.564,-57.943": "Tierra del Fuego, Falkland Islands",
+    "-25.298,130.978": "Northern Territory, Australia",
+    "71.031,25.991": "Finnmark, Norway",
+    "60.381,-1.635": "Scotland, United Kingdom",
+    "-36.050,136.747": "South Australia, Australia",
+    "67.980,13.146": "Nordland, Norway",
+    "-49.218,-72.906": "Lago Argentino, Santa Cruz",
+    "-24.718,15.555": "Hardap, Namibia",
+    "-23.029,-68.150": "Provincia de El Loa, Antofagasta Region"
+  }
+}
