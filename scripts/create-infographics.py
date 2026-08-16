@@ -144,38 +144,49 @@ hex_panels = [
     ),
 ]
 
-points_panels = [
-    (
-        "Photos per capita",
-        "Photos per 1,000 residents",
-        source("flickr-2026-points-per-capita-equal-earth-8k.png"),
-    ),
-    (
-        "Photo count",
-        "Individual geotagged photos",
-        source("flickr-2026-points-photos-equal-earth-8k.png"),
-    ),
-    (
-        "World population",
-        "GHSL resident population (2020)",
-        source("flickr-2026-points-population-equal-earth-8k.png"),
-    ),
-]
 
-outputs = [
-    build_infographic(
-        "infographic-hex-equal-earth.png",
-        "PHOTO GEOGRAPHY 2026: HEX VIEW",
-        SUBTITLE,
-        hex_panels,
-    ),
-    build_infographic(
-        "infographic-points-equal-earth.png",
-        "PHOTO GEOGRAPHY 2026: POINTS VIEW",
-        SUBTITLE,
-        points_panels,
-    ),
-]
+def points_panels() -> list[tuple[str, str, Path]]:
+    return [
+        (
+            "Photos per capita",
+            "Photos per 1,000 residents",
+            source("flickr-2026-points-per-capita-equal-earth-8k.png"),
+        ),
+        (
+            "Photo count",
+            "Individual geotagged photos",
+            source("flickr-2026-points-photos-equal-earth-8k.png"),
+        ),
+        (
+            "World population",
+            "GHSL resident population (2020)",
+            source("flickr-2026-points-population-equal-earth-8k.png"),
+        ),
+    ]
 
-for output in outputs:
-    print(output)
+
+if __name__ == "__main__":
+    import sys
+
+    targets = set(sys.argv[1:]) or {"hex", "points"}
+    outputs: list[Path] = []
+    if "hex" in targets:
+        outputs.append(
+            build_infographic(
+                "infographic-hex-equal-earth.png",
+                "PHOTO GEOGRAPHY 2026: HEX VIEW",
+                SUBTITLE,
+                hex_panels,
+            )
+        )
+    if "points" in targets:
+        outputs.append(
+            build_infographic(
+                "infographic-points-equal-earth.png",
+                "PHOTO GEOGRAPHY 2026: POINTS VIEW",
+                SUBTITLE,
+                points_panels(),
+            )
+        )
+    for output in outputs:
+        print(output)

@@ -130,17 +130,19 @@ const EQUAL_EARTH_INITIAL: OrthographicViewState = {
   maxZoom: 8,
 }
 
-const BASEMAP = {
+function basemap(theme: ThemeMode) {
+  const style = theme === 'light' ? 'light_all' : 'dark_all'
+  return {
   version: 8 as const,
-  name: 'dark',
+  name: theme,
   sources: {
     carto: {
       type: 'raster' as const,
       tiles: [
-        'https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}@2x.png',
-        'https://b.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}@2x.png',
-        'https://c.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}@2x.png',
-        'https://d.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}@2x.png',
+        `https://a.basemaps.cartocdn.com/${style}/{z}/{x}/{y}@2x.png`,
+        `https://b.basemaps.cartocdn.com/${style}/{z}/{x}/{y}@2x.png`,
+        `https://c.basemaps.cartocdn.com/${style}/{z}/{x}/{y}@2x.png`,
+        `https://d.basemaps.cartocdn.com/${style}/{z}/{x}/{y}@2x.png`,
       ],
       tileSize: 256,
       attribution: '© OpenStreetMap © CARTO',
@@ -148,18 +150,20 @@ const BASEMAP = {
   },
   layers: [
     {
-      id: 'carto-dark',
+      id: `carto-${theme}`,
       type: 'raster' as const,
       source: 'carto',
       minzoom: 0,
       maxzoom: 20,
     },
   ],
+  }
 }
 
 type ViewMode = 'hex' | 'points'
 type MetricMode = 'photos' | 'population' | 'per-capita'
 type ProjectionMode = 'mercator' | 'equal-earth'
+type ThemeMode = 'dark' | 'light'
 type XY = [number, number]
 type Rgba = [number, number, number, number]
 type ProjectedPoint = { source: PhotoPoint; position: XY; color: Rgba }
@@ -219,7 +223,7 @@ function metricHint(viewMode: ViewMode, metric: MetricMode): string {
  * Perceptually uniform + colorblind-safer than rainbow/jet; greyscale-friendly.
  * @see https://bids.github.io/colormap/
  */
-const DENSITY_COLORS: Rgba[] = [
+const DARK_DENSITY_COLORS: Rgba[] = [
   [55, 14, 94, 195],
   [105, 23, 110, 210],
   [158, 47, 89, 220],
@@ -233,7 +237,7 @@ const DENSITY_COLORS: Rgba[] = [
  * Points share Inferno’s warm half only — sparse dots stay luminous amber/gold
  * on dark land/ocean; denser cells climb toward yellow-white.
  */
-const POINT_COLORS: Rgba[] = [
+const DARK_POINT_COLORS: Rgba[] = [
   [255, 196, 110, 125],
   [248, 150, 55, 155],
   [240, 110, 45, 180],
@@ -241,11 +245,40 @@ const POINT_COLORS: Rgba[] = [
   [252, 230, 130, 235],
 ]
 
+/** Fischer-inspired print palette: cool sparse traces through yellow to red. */
+const LIGHT_DENSITY_COLORS: Rgba[] = [
+  [79, 45, 173, 190],
+  [48, 67, 190, 205],
+  [52, 122, 181, 220],
+  [239, 202, 69, 235],
+  [235, 112, 37, 245],
+  [210, 34, 47, 250],
+  [170, 0, 93, 255],
+]
+
+const LIGHT_POINT_COLORS: Rgba[] = [
+  [79, 45, 173, 135],
+  [48, 67, 190, 165],
+  [239, 202, 69, 195],
+  [225, 74, 39, 225],
+  [170, 0, 93, 245],
+]
+
+function densityColors(theme: ThemeMode): Rgba[] {
+  return theme === 'light' ? LIGHT_DENSITY_COLORS : DARK_DENSITY_COLORS
+}
+
+function pointPalette(theme: ThemeMode): Rgba[] {
+  return theme === 'light' ? LIGHT_POINT_COLORS : DARK_POINT_COLORS
+}
+
 /** Color each point from local geographic density (no glow). */
 function buildPointDensityColors(
   points: PhotoPoint[],
   cellDeg = 0.7,
+  theme: ThemeMode = 'dark',
 ): Rgba[] {
+  const colors = pointPalette(theme)
   const counts = new Map<string, number>()
   const keys = new Array<string>(points.length)
 
@@ -264,20 +297,25 @@ function buildPointDensityColors(
     // Sparse cells stay near the original amber; only denser cells climb the ramp.
     const t = Math.min(1, Math.pow(count / cap, 0.55))
     const colorIndex = Math.min(
-      POINT_COLORS.length - 1,
-      Math.floor(t * POINT_COLORS.length),
+      colors.length - 1,
+      Math.floor(t * colors.length),
     )
-    return POINT_COLORS[colorIndex]
+    return colors[colorIndex]
   })
 }
 
-function colorFromMetricValue(value: number, cap: number): Rgba {
+function colorFromMetricValue(
+  value: number,
+  cap: number,
+  theme: ThemeMode = 'dark',
+): Rgba {
+  const colors = densityColors(theme)
   const normalized = Math.log1p(Math.min(value, cap)) / Math.log1p(cap)
   const colorIndex = Math.min(
-    DENSITY_COLORS.length - 1,
-    Math.floor(normalized * DENSITY_COLORS.length),
+    colors.length - 1,
+    Math.floor(normalized * colors.length),
   )
-  return DENSITY_COLORS[colorIndex]
+  return colors[colorIndex]
 }
 
 function cellsForMetric(
@@ -446,6 +484,7 @@ function buildMetricHexes(
   metric: MetricMode,
   populationFloor: number,
   toVertex: (x: number, y: number) => [number, number],
+  theme: ThemeMode = 'dark',
 ): MetricHex[] {
   const { radius, q, r, photos, population } = aggregates
   const keep: number[] = []
@@ -481,7 +520,7 @@ function buildMetricHexes(
         cy + radius * HEX_COVERAGE * Math.sin(angle),
       )
     })
-    return { polygon, color: colorFromMetricValue(values[n], cap) }
+    return { polygon, color: colorFromMetricValue(values[n], cap, theme) }
   })
 }
 
@@ -513,9 +552,10 @@ function buildPointMetricColors(
   points: PhotoPoint[],
   dataset: PopulationRateDataset | null,
   metric: MetricMode,
+  theme: ThemeMode = 'dark',
 ): Rgba[] {
   if (!dataset || metric === 'photos') {
-    return buildPointDensityColors(points)
+    return buildPointDensityColors(points, 0.7, theme)
   }
 
   const field = metricField(metric)
@@ -528,19 +568,21 @@ function buildPointMetricColors(
   return points.map((point) => {
     const value =
       lookup.get(cellCenterKey(point.lat, point.lon, dataset.cellDegrees)) ?? 0
-    return colorFromMetricValue(Math.max(value, 0), cap)
+    return colorFromMetricValue(Math.max(value, 0), cap, theme)
   })
 }
 
 /** One colored dot per inhabited cell — Points view for World pop. */
 function buildPopulationPointColors(
   dataset: PopulationRateDataset | null,
+  theme: ThemeMode = 'dark',
 ): Rgba[] {
   if (!dataset) return []
   const cap = metricCap(dataset, 'population', 'population')
   // Opaque + lifted low end so sparse regions don't vanish into black land.
   return dataset.cells.map((cell) => {
-    const [r, g, b] = colorFromMetricValue(cell.population, cap)
+    const [r, g, b] = colorFromMetricValue(cell.population, cap, theme)
+    if (theme === 'light') return [r, g, b, 235]
     return [
       Math.min(255, Math.round(r + (255 - r) * 0.12)),
       Math.min(255, Math.round(g + (255 - g) * 0.1)),
@@ -698,8 +740,17 @@ export function MapView({
   const [metricMode, setMetricMode] = useState<MetricMode>('photos')
   const [projectionMode, setProjectionMode] =
     useState<ProjectionMode>('mercator')
+  const [themeMode, setThemeMode] = useState<ThemeMode>('dark')
   const [exporting, setExporting] = useState(false)
   const legend = metricLegendLabels(metricMode)
+  const palette = densityColors(themeMode)
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = themeMode
+    return () => {
+      delete document.documentElement.dataset.theme
+    }
+  }, [themeMode])
 
   const exportHighRes = useCallback(async () => {
     if (exporting || points.length === 0) return
@@ -718,6 +769,7 @@ export function MapView({
           viewMode,
           metricMode,
           projectionMode,
+          themeMode,
           downloadedAt,
           selectedFocus,
           populationRates,
@@ -744,6 +796,7 @@ export function MapView({
     mostViewed,
     points,
     projectionMode,
+    themeMode,
     populationRates,
     selectedFocus,
     showHottestMarkers,
@@ -760,6 +813,7 @@ export function MapView({
           populationRates={populationRates}
           viewMode={viewMode}
           metricMode={metricMode}
+          themeMode={themeMode}
           showHottestMarkers={showHottestMarkers}
           showMostViewedMarkers={showMostViewedMarkers}
           focus={focus}
@@ -774,6 +828,7 @@ export function MapView({
           populationRates={populationRates}
           viewMode={viewMode}
           metricMode={metricMode}
+          themeMode={themeMode}
           showHottestMarkers={showHottestMarkers}
           showMostViewedMarkers={showMostViewedMarkers}
           focus={focus}
@@ -828,6 +883,16 @@ export function MapView({
             value={projectionMode}
             onChange={(value) => setProjectionMode(value as ProjectionMode)}
           />
+          <ToggleGroup
+            label="Theme"
+            compact
+            options={[
+              { value: 'dark', label: 'Dark' },
+              { value: 'light', label: 'Light' },
+            ]}
+            value={themeMode}
+            onChange={(value) => setThemeMode(value as ThemeMode)}
+          />
           <button
             type="button"
             className={`marker-chip${showHottestMarkers ? ' is-active' : ''}`}
@@ -867,7 +932,7 @@ export function MapView({
           <div
             className="density-legend__ramp"
             style={{
-              background: `linear-gradient(90deg, ${DENSITY_COLORS.map(
+              background: `linear-gradient(90deg, ${palette.map(
                 ([r, g, b]) => `rgb(${r},${g},${b})`,
               ).join(', ')})`,
             }}
@@ -900,6 +965,7 @@ type MapModeProps = Pick<
 > & {
   viewMode: ViewMode
   metricMode: MetricMode
+  themeMode: ThemeMode
   showHottestMarkers: boolean
   showMostViewedMarkers: boolean
 }
@@ -964,6 +1030,7 @@ function MercatorMap({
   populationRates,
   viewMode,
   metricMode,
+  themeMode,
   showHottestMarkers,
   showMostViewedMarkers,
   focus,
@@ -973,12 +1040,12 @@ function MercatorMap({
   const [viewState, setViewState] = useState<MapViewState>(INITIAL_VIEW)
   const [hover, setHover] = useState<HoverInfo>(null)
   const pointColors = useMemo(
-    () => buildPointMetricColors(points, populationRates, metricMode),
-    [points, populationRates, metricMode],
+    () => buildPointMetricColors(points, populationRates, metricMode, themeMode),
+    [points, populationRates, metricMode, themeMode],
   )
   const populationPointColors = useMemo(
-    () => buildPopulationPointColors(populationRates),
-    [populationRates],
+    () => buildPopulationPointColors(populationRates, themeMode),
+    [populationRates, themeMode],
   )
   const populationPointPositions = useMemo(() => {
     if (!populationRates) return [] as [number, number][]
@@ -1027,8 +1094,9 @@ function MercatorMap({
         metricMode,
         populationRates?.populationFloor ?? 1_000,
         fromMercatorWorld,
+        themeMode,
       ),
-    [hexAggregates, metricMode, populationRates?.populationFloor],
+    [hexAggregates, metricMode, populationRates?.populationFloor, themeMode],
   )
   // Hexes only in hex view (until deep zoom). Points view always shows points —
   // World pop uses one dot per inhabited cell (also used as the hex handoff).
@@ -1262,7 +1330,7 @@ function MercatorMap({
         onClick={onClick}
         getCursor={({ isHovering }) => (isHovering ? 'pointer' : 'grab')}
       >
-        <MapLibreMap mapStyle={BASEMAP} attributionControl={false} />
+        <MapLibreMap mapStyle={basemap(themeMode)} attributionControl={false} />
       </DeckGL>
 
       {hover && <MarkerTooltip hover={hover} />}
@@ -1277,6 +1345,7 @@ function EqualEarthMap({
   populationRates,
   viewMode,
   metricMode,
+  themeMode,
   showHottestMarkers,
   showMostViewedMarkers,
   focus,
@@ -1324,16 +1393,21 @@ function EqualEarthMap({
   }, [panRequest])
 
   const projectedPoints = useMemo<ProjectedPoint[]>(() => {
-    const colors = buildPointMetricColors(points, populationRates, metricMode)
+    const colors = buildPointMetricColors(
+      points,
+      populationRates,
+      metricMode,
+      themeMode,
+    )
     return points.map((source, index) => ({
       source,
       position: project(source.lon, source.lat),
       color: colors[index],
     }))
-  }, [points, populationRates, metricMode])
+  }, [points, populationRates, metricMode, themeMode])
   const projectedPopulationDots = useMemo(() => {
     if (!populationRates) return []
-    const colors = buildPopulationPointColors(populationRates)
+    const colors = buildPopulationPointColors(populationRates, themeMode)
     const cellDeg = populationRates.cellDegrees
     return populationRates.cells.map((cell, index) => {
       const [lon, lat] = jitterCellCenter(cell.lat, cell.lon, cellDeg)
@@ -1342,7 +1416,7 @@ function EqualEarthMap({
         color: colors[index],
       }
     })
-  }, [populationRates])
+  }, [populationRates, themeMode])
   const populationPointRadius = useMemo(
     () =>
       populationPointRadiusPx(
@@ -1403,8 +1477,9 @@ function EqualEarthMap({
         populationRates?.populationFloor ?? 1_000,
         // Already in Equal Earth space; hand the vertex through untouched.
         (x, y) => [x, y],
+        themeMode,
       ),
-    [hexAggregates, metricMode, populationRates?.populationFloor],
+    [hexAggregates, metricMode, populationRates?.populationFloor, themeMode],
   )
 
   const layers = useMemo(() => {
@@ -1413,8 +1488,10 @@ function EqualEarthMap({
       data: WORLD_POLYGONS,
       coordinateSystem: COORDINATE_SYSTEM.CARTESIAN,
       getPolygon: (d) => d,
-      getFillColor: [20, 24, 27, 255],
-      getLineColor: [68, 73, 76, 180],
+      getFillColor:
+        themeMode === 'light' ? [244, 241, 232, 255] : [20, 24, 27, 255],
+      getLineColor:
+        themeMode === 'light' ? [170, 165, 154, 180] : [68, 73, 76, 180],
       lineWidthMinPixels: 0.5,
       stroked: true,
       filled: true,
@@ -1543,6 +1620,7 @@ function EqualEarthMap({
     showPopulationPoints,
     showHottestMarkers,
     showMostViewedMarkers,
+    themeMode,
   ])
 
   const onHover = useCallback(
@@ -1773,6 +1851,7 @@ async function downloadHighResMap(
     viewMode: ViewMode
     metricMode: MetricMode
     projectionMode: ProjectionMode
+    themeMode: ThemeMode
     downloadedAt?: string
     selectedFocus?: MapFocus | null
     populationRates?: PopulationRateDataset | null
@@ -1796,8 +1875,9 @@ async function downloadHighResMap(
   )
   const path = geoPath(projection, context)
 
-  // Flat, print-friendly foundation — darker land so points punch through.
-  context.fillStyle = '#05070a'
+  const isLight = options.themeMode === 'light'
+  // Flat, print-friendly foundation matching the selected live theme.
+  context.fillStyle = isLight ? '#f4f2ec' : '#05070a'
   context.fillRect(0, 0, width, height)
 
   // Mercator only: soft ocean plate. Equal Earth skips the rounded Sphere
@@ -1805,24 +1885,26 @@ async function downloadHighResMap(
   if (options.projectionMode === 'mercator') {
     context.beginPath()
     path({ type: 'Sphere' })
-    context.fillStyle = '#0a0e12'
+    context.fillStyle = isLight ? '#e8e5dd' : '#0a0e12'
     context.fill()
-    context.strokeStyle = '#3a454d'
+    context.strokeStyle = isLight ? '#b7b2a8' : '#3a454d'
     context.lineWidth = 3
     context.stroke()
   }
 
   context.beginPath()
   path(geoGraticule10())
-  context.strokeStyle = 'rgba(90, 105, 115, 0.18)'
+  context.strokeStyle = isLight
+    ? 'rgba(115, 105, 95, 0.2)'
+    : 'rgba(90, 105, 115, 0.18)'
   context.lineWidth = 1
   context.stroke()
 
   context.beginPath()
   path(WORLD_COUNTRIES)
-  context.fillStyle = '#12171c'
+  context.fillStyle = isLight ? '#ece9e1' : '#12171c'
   context.fill()
-  context.strokeStyle = '#3f4a52'
+  context.strokeStyle = isLight ? '#b8b1a5' : '#3f4a52'
   context.lineWidth = 1.5
   context.stroke()
 
@@ -1836,16 +1918,23 @@ async function downloadHighResMap(
       options.metricMode,
       options.populationRates ?? null,
       options.hexDegrees,
+      options.themeMode,
     )
   } else if (
     options.metricMode === 'population' &&
     options.populationRates
   ) {
-    drawExportPopulationPoints(context, options.populationRates, projection)
+    drawExportPopulationPoints(
+      context,
+      options.populationRates,
+      projection,
+      options.themeMode,
+    )
   } else {
     drawExportPoints(context, points, projection, {
       metricMode: options.metricMode,
       populationRates: options.populationRates,
+      themeMode: options.themeMode,
     })
   }
 
@@ -1862,10 +1951,10 @@ async function downloadHighResMap(
   // Header mirrors the live map.
   const asOf = formatAsOfDate(options.downloadedAt)
   context.textBaseline = 'alphabetic'
-  context.fillStyle = '#ffd23c'
+  context.fillStyle = isLight ? '#a8005b' : '#ffd23c'
   context.font = '800 72px Arial, sans-serif'
   context.fillText('Most photographed places 2026', 260, 210)
-  context.fillStyle = '#9ba6ad'
+  context.fillStyle = isLight ? '#5e5a54' : '#9ba6ad'
   context.font = '400 28px Arial, sans-serif'
   context.fillText(
     [
@@ -1885,6 +1974,7 @@ async function downloadHighResMap(
     300,
     `Low ${legend.title.toLowerCase()}`,
     `High ${legend.title.toLowerCase()}`,
+    options.themeMode,
   )
 
   drawExportControls(context, width, options)
@@ -1897,7 +1987,7 @@ async function downloadHighResMap(
   }
 
   context.textAlign = 'left'
-  context.fillStyle = '#75818a'
+  context.fillStyle = isLight ? '#6f6a62' : '#75818a'
   context.font = '400 22px Arial, sans-serif'
   context.fillText(
     'Built by kobakhit · Flickr · GHSL GHS-POP R2023A · Natural Earth · 7680 × 4320',
@@ -1916,7 +2006,7 @@ async function downloadHighResMap(
     options.hexDegrees !== undefined
       ? `-${hexDegreesLabel(options.hexDegrees)}deg`
       : ''
-  }.png`
+  }${options.themeMode === 'light' ? '-light' : ''}.png`
   const sink = (
     window as Window & {
       __hexExportSink?: (blob: Blob, filename: string) => Promise<void> | void
@@ -1976,12 +2066,14 @@ function drawExportPoints(
   options?: {
     metricMode?: MetricMode
     populationRates?: PopulationRateDataset | null
+    themeMode?: ThemeMode
   },
 ) {
   const colors = buildPointMetricColors(
     points,
     options?.populationRates ?? null,
     options?.metricMode ?? 'photos',
+    options?.themeMode ?? 'dark',
   )
   const pointSize = 3.6
   const half = pointSize / 2
@@ -2012,8 +2104,9 @@ function drawExportPopulationPoints(
   context: CanvasRenderingContext2D,
   dataset: PopulationRateDataset,
   projection: GeoProjection,
+  theme: ThemeMode,
 ) {
-  const colors = buildPopulationPointColors(dataset)
+  const colors = buildPopulationPointColors(dataset, theme)
   const origin = projection([0, 0])
   const eastward = projection([dataset.cellDegrees, 0])
   const northward = projection([0, dataset.cellDegrees])
@@ -2064,6 +2157,7 @@ function drawExportHexes(
   metric: MetricMode,
   dataset: PopulationRateDataset | null,
   hexDegrees?: number,
+  theme: ThemeMode = 'dark',
 ) {
   const toSpace = (lon: number, lat: number): XY =>
     (projection([lon, lat]) as XY | null) ?? [NaN, NaN]
@@ -2085,6 +2179,7 @@ function drawExportHexes(
     metric,
     dataset?.populationFloor ?? 1_000,
     (x, y) => [x, y],
+    theme,
   )
 
   // Batch by color so the 8K canvas isn't restyled per hex.
@@ -2264,13 +2359,15 @@ function drawExportDensityLegend(
   y: number,
   lowLabel = 'Low density',
   highLabel = 'High density',
+  theme: ThemeMode = 'dark',
 ) {
   const rampWidth = 520
   const rampHeight = 22
   const gradient = context.createLinearGradient(x, y, x + rampWidth, y)
-  DENSITY_COLORS.forEach(([r, g, b], index) => {
+  const colors = densityColors(theme)
+  colors.forEach(([r, g, b], index) => {
     gradient.addColorStop(
-      index / Math.max(DENSITY_COLORS.length - 1, 1),
+      index / Math.max(colors.length - 1, 1),
       `rgb(${r},${g},${b})`,
     )
   })
@@ -2295,6 +2392,7 @@ function drawExportControls(
     viewMode: ViewMode
     metricMode: MetricMode
     projectionMode: ProjectionMode
+    themeMode: ThemeMode
     showHottestMarkers?: boolean
     showMostViewedMarkers?: boolean
   },
@@ -2356,16 +2454,15 @@ function drawExportControls(
     120,
   )
 
-  context.fillStyle = 'rgba(255, 210, 60, 0.12)'
-  context.strokeStyle = 'rgba(255, 210, 60, 0.6)'
-  context.lineWidth = 2
-  context.fillRect(x + 1520, y + 148, 265, 65)
-  context.strokeRect(x + 1520, y + 148, 265, 65)
-  context.fillStyle = '#ffd23c'
-  context.font = '600 27px Arial, sans-serif'
-  context.textAlign = 'center'
-  context.fillText('Export 8K', x + 1652, y + 190)
-  context.textAlign = 'start'
+  drawExportToggle(
+    context,
+    x + 1525,
+    y + 148,
+    'THEME',
+    ['Dark', 'Light'],
+    options.themeMode === 'dark' ? 0 : 1,
+    120,
+  )
 }
 
 function drawExportToggle(
